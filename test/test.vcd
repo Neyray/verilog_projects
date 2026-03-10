@@ -1,5 +1,5 @@
 $date
-	Wed Mar 04 16:45:34 2026
+	Mon Mar  9 12:35:23 2026
 $end
 $version
 	Icarus Verilog
@@ -21,9 +21,6 @@ $var reg 32 ) C [31:0] $end
 $upscope $end
 $upscope $end
 $enddefinitions $end
-$comment Show the parameter values. $end
-$dumpall
-$end
 #0
 $dumpvars
 b101 )

@@ -89,7 +89,6 @@ module sccomp(clk, rstn, sw_i, disp_seg_o, disp_an_o);
             display_data = led_disp_data;
         end
     end
-    
     // 7段数码管显示模块实例化
     seg7x16 u_seg7x16(
         .clk(clk),

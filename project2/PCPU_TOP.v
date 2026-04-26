@@ -52,6 +52,7 @@ wire [1:0]  counter_set;
 wire counter0_OUT;
 wire counter1_OUT;
 wire counter2_OUT;
+wire [31:0] counter_out;
 
 // U1_SCPU
 wire [31:0] Adder_out;
@@ -78,8 +79,11 @@ wire        GPIOe0000000_we;
 wire        GPIOf0000000_we;
 wire [31:0] Peripheral_in;
 wire        counter_we;
+wire        data_ram_we;
 wire [9:0]  ram_addr;
 wire [31:0] ram_data_in;
+wire [3:0]  ram_wea;
+assign ram_wea = data_ram_we ? wea_mem : 4'b0000;
 
 // U5_Multi_8CH32
 wire [31:0] Disp_num;
@@ -132,7 +136,7 @@ RAM_B U3_R(
     .addra(ram_addr),
     .clka(clka0_i),
     .dina(Data_write_to_dm),
-    .wea(wea_mem),
+    .wea(ram_wea),
     .douta(douta)
 );
 
@@ -148,13 +152,14 @@ MIO_BUS U4(
     .addr_bus(Adder_out),
     .ram_data_out(douta),
     .led_out(LED_out),
-    .counter_out(none),
+    .counter_out(counter_out),
     .counter0_out(counter0_OUT),
     .counter1_out(counter1_OUT),
     .counter2_out(counter2_OUT),
     .Cpu_data4bus(Cpu_data4bus),
     .ram_data_in(ram_data_in),
     .ram_addr(ram_addr),
+    .data_ram_we(data_ram_we),
     .GPIOf0000000_we(GPIOf0000000_we),
     .GPIOe0000000_we(GPIOe0000000_we),
     .counter_we(counter_we),
@@ -171,7 +176,7 @@ Multi_8CH32 U5(
     .data0(Peripheral_in),
     .data1({2'b00, PC_out[31:2]}),
     .data2(spo),
-    .data3(none),
+    .data3(counter_out),
     .data4(Adder_out),
     .data5(Data_out),
     .data6(Cpu_data4bus),
@@ -227,7 +232,8 @@ Counter_x U9(
     .counter_ch(counter_set),
     .counter0_OUT(counter0_OUT),
     .counter1_OUT(counter1_OUT),
-    .counter2_OUT(counter2_OUT)
+    .counter2_OUT(counter2_OUT),
+    .counter_out(counter_out)
 );
 
 // ---------- U10: Enter ----------

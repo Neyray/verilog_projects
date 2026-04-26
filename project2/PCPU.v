@@ -58,6 +58,14 @@ module PCPU(
     // ================================================================
     reg [31:0] rf [0:31];
 
+    // --- 前向声明：ID/EX 前递和 WB->ID 同拍读写旁路共用 ---
+    wire [31:0] ex_mem_wb_data;
+    wire [31:0] wb_data;
+    reg [4:0]  EX_MEM_rd;
+    reg        EX_MEM_wb_en;
+    reg [4:0]  MEM_WB_rd;
+    reg        MEM_WB_wb_en;
+
     // ================================================================
     //                    ★ IF 阶段 ★
     // ================================================================
@@ -147,8 +155,16 @@ module PCPU(
                                     id_imm_I;  // LOAD, ALUI, JALR
 
     // --- 读寄存器堆 ---
-    wire [31:0] id_rs1_data = (id_rs1 == 5'b0) ? 32'b0 : rf[id_rs1];
-    wire [31:0] id_rs2_data = (id_rs2 == 5'b0) ? 32'b0 : rf[id_rs2];
+    wire [31:0] id_rs1_raw = (id_rs1 == 5'b0) ? 32'b0 : rf[id_rs1];
+    wire [31:0] id_rs2_raw = (id_rs2 == 5'b0) ? 32'b0 : rf[id_rs2];
+
+    // WB 和 ID 同拍发生时，寄存器堆组合读会先看到旧值。
+    // 这里把当前 WB 阶段的数据直接旁路到 ID，修复间隔 3 条指令的 RAW 依赖。
+    wire wb_to_id_rs1 = MEM_WB_wb_en && (MEM_WB_rd != 5'b0) && (MEM_WB_rd == id_rs1);
+    wire wb_to_id_rs2 = MEM_WB_wb_en && (MEM_WB_rd != 5'b0) && (MEM_WB_rd == id_rs2);
+
+    wire [31:0] id_rs1_data = wb_to_id_rs1 ? wb_data : id_rs1_raw;
+    wire [31:0] id_rs2_data = wb_to_id_rs2 ? wb_data : id_rs2_raw;
 
     // --- 写回使能 ---
     wire id_wb_en = id_is_lui | id_is_auipc | id_is_jal | id_is_jalr |
@@ -252,18 +268,6 @@ module PCPU(
     //                    ★ EX 阶段 ★
     //  ALU 运算 + 分支判断 + 前递 (Forwarding)
     // ================================================================
-
-    // --- 前向声明 MEM 和 WB 阶段的写回数据（用于前递） ---
-    // EX/MEM 阶段的写回数据候选
-    wire [31:0] ex_mem_wb_data;   // 下面赋值
-    // MEM/WB 阶段的最终写回数据
-    wire [31:0] wb_data;          // 下面赋值
-
-    // --- 前向声明 EX/MEM 和 MEM/WB 的控制信号（用于前递判断） ---
-    reg [4:0]  EX_MEM_rd;
-    reg        EX_MEM_wb_en;
-    reg [4:0]  MEM_WB_rd;
-    reg        MEM_WB_wb_en;
 
     // ================================================================
     //  前递逻辑 (Forwarding Unit)

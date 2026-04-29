@@ -281,9 +281,9 @@ module PCPU(
     wire fwd_mem_wb_rs2 = MEM_WB_wb_en && (MEM_WB_rd != 5'b0) && (MEM_WB_rd == ID_EX_rs2);
 
     wire [31:0] ex_rs1_data =
-        fwd_ex_mem_rs1 ? ex_mem_wb_data :
-        fwd_mem_wb_rs1 ? wb_data        :
-                         ID_EX_rs1_data;
+        fwd_ex_mem_rs1 ? ex_mem_wb_data :   // EX/MEM 优先（更新）
+        fwd_mem_wb_rs1 ? wb_data        :     // 次选 MEM/WB
+                         ID_EX_rs1_data;     // 无冒险，用寄存器堆值
 
     wire [31:0] ex_rs2_data =
         fwd_ex_mem_rs2 ? ex_mem_wb_data :
@@ -375,9 +375,17 @@ module PCPU(
 
     // --- EX 阶段产生的"写回数据候选"（用于前递，不含 load） ---
     // 注意：load 的数据要到 MEM 阶段才拿到，所以 load-use 需要 stall
+
+    //这是一个中间信号，它表示：仅仅在 EX 这个阶段，我们能算出的“准备写回”的数据是什么？
+    //如果是算术指令，结果自然是 ALU 算出来的 alu_out
+    //如果是跳转指令（JAL/JALR），我们要把返回地址（也就是当前指令的下一条，PC+4）存进寄存器里，所以结果是 ID_EX_PC + 32'd4
+
+    //实际上是废代码，使用的是451行的ex_mem_wb_data
     wire [31:0] ex_wb_candidate =
         (ID_EX_is_jal | ID_EX_is_jalr) ? (ID_EX_PC + 32'd4) :
                                           alu_out;
+
+
 
     // ================================================================
     //  Load-Use 冒险检测
@@ -385,10 +393,13 @@ module PCPU(
     //  如果 EX 阶段是 load，且 ID 阶段的源寄存器依赖 load 的目标，
     //  则需要暂停 1 拍。
     // ================================================================
+    //stall = (EX 段是 LOAD) && (LOAD 的 rd == ID 段的 rs1 或 rs2)
     assign stall = ID_EX_is_load && (ID_EX_rd != 5'b0) &&
                    ((ID_EX_rd == id_rs1 && (id_is_alur || id_is_alui || id_is_load ||
                                             id_is_store || id_is_branch || id_is_jalr)) ||
                     (ID_EX_rd == id_rs2 && (id_is_alur || id_is_branch || id_is_store)));
+
+
 
     // ================================================================
     //              ★ EX/MEM 流水线寄存器 ★
@@ -434,6 +445,9 @@ module PCPU(
     // 注意：如果 EX/MEM 是 load，这个值还不是最终值！
     // 但 load-use stall 已经保证了 load 后面不会立即用到
     // 所以到下一拍时 load 会在 MEM/WB 阶段，用 wb_data 前递
+
+    //这个信号是真正用来“往回传”（前递给 EX 阶段）的数据 。它处于 MEM 阶段
+    //这个信号直接连到了前递实现（278起）里的 ex_rs1_data 和 ex_rs2_data 的多路选择器里，供 EX 阶段使用
     assign ex_mem_wb_data =
         (EX_MEM_is_jal | EX_MEM_is_jalr) ? (EX_MEM_PC + 32'd4) :
         EX_MEM_is_load                    ? Data_in :  // MEM阶段load数据已到

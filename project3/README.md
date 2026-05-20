@@ -153,23 +153,56 @@ CPU 内部在 EX 阶段判断 `mem_w && Addr[31:28]==0xD`，然后：
 
 ## PCPU_TOP.v 改动一览
 
-```verilog
-// 中断源：BTN_out[1] 上升沿检测（Clk_CPU 域）
-reg btn1_d;
-always @(posedge Clk_CPU or posedge rst_i) begin
-    if (rst_i) btn1_d <= 1'b0;
-    else       btn1_d <= BTN_out[1];
-end
-wire int_pulse = BTN_out[1] & ~btn1_d;
+> **v2 改动**：之前简单的 `btn1_d <= BTN_out[1]` 直接在 `Clk_CPU` 域采样异步 `BTN_out[1]`，会因为机械按键 5–20 ms 的抖动出现**漏触发或多触发**（GPT 一眼看出来的硬伤）。v2 改成 *消抖 + 100MHz 同源边沿 + 拉宽 + 跨时钟 2-FF 同步 + Clk_CPU 域边沿* 的标准链路。
 
-// PCPU 实例化：将 INT 由 1'b0 改为 int_pulse
-PCPU U1(
-    ...
-    .INT(int_pulse)
-);
+```verilog
+// [A] 100MHz 域消抖 (~21ms 必须稳定才接受新电平)
+reg [20:0] dbnc_cnt;
+reg        btn1_dbnc;
+always @(posedge clk or posedge rst_i)
+    if (rst_i)                              {dbnc_cnt, btn1_dbnc} <= 0;
+    else if (BTN_out[1] == btn1_dbnc)       dbnc_cnt <= 0;
+    else if (&dbnc_cnt)                     btn1_dbnc <= BTN_out[1];
+    else                                    dbnc_cnt <= dbnc_cnt + 1;
+
+// [B] 100MHz 域上升沿 (同源时钟内做边沿一定不丢)
+reg btn1_dbnc_d;
+always @(posedge clk) btn1_dbnc_d <= btn1_dbnc;
+wire btn1_rising = btn1_dbnc & ~btn1_dbnc_d;
+
+// [C] 拉宽到 ~500ms (慢档 Clk_CPU 周期 333ms, 保证至少 1 次 posedge 命中)
+reg [25:0] req_cnt; reg int_req;
+always @(posedge clk)
+    if (btn1_rising)                        {int_req, req_cnt} <= {1'b1, 26'd0};
+    else if (int_req && req_cnt == 50_000_000) int_req <= 0;
+    else if (int_req)                       req_cnt <= req_cnt + 1;
+
+// [D] 跨时钟 2-FF 同步器
+reg int_req_s0, int_req_s1;
+always @(posedge Clk_CPU) {int_req_s1, int_req_s0} <= {int_req_s0, int_req};
+
+// [E] Clk_CPU 域上升沿 → 单拍 INT 给 CPU
+reg int_req_d;
+always @(posedge Clk_CPU) int_req_d <= int_req_s1;
+wire int_pulse = int_req_s1 & ~int_req_d;
+
+PCPU U1( ... .INT(int_pulse) );
 ```
 
-外设、显示、时钟分频、总线全部沿用 Project 2，**一行不改**。
+为什么需要这么复杂？
+
+| 问题 | 旧实现 | v2 修复 |
+|------|--------|---------|
+| 按键抖动 5–20ms → 多次伪边沿 | 没消抖 | [A] 21ms 稳定才接受 |
+| 异步信号在目标域直接采样 → 元稳态 | 单 FF 采样 | [B][C][D] 同源采样 → 拉宽 → 双 FF 同步 |
+| 慢档 Clk_CPU 周期 333ms > 按键持续时间 → 漏触发 | 直接采按键电平 | [C] 把 1 拍宽脉冲拉宽到 500ms 再过桥 |
+| 按住按键不放 → 持续触发 | 边沿检测可控 | 同样靠边沿，但是在干净的 `int_req` 上做边沿 |
+
+外设、总线、时钟分频、`PCPU` 接口全部沿用 Project 2，**只改 INT 这一根线**。
+
+### XDC 时钟约束（v2 关键修复）
+
+旧的 [icf.xdc](icf.xdc) 第 3 行写的是 `create_clock ... -period 100.00`，**100ns 周期 = 10MHz**，但板子是 100MHz。Vivado 按 10MHz 做时序分析允许极长组合路径，实际跑 100MHz 时某些路径压在 setup/hold 边界 → 快档下出现"按 BTNU 偶尔无反应 / PC 显示偶尔跳错"。改成 `-period 10.00 -waveform {0 5}` 后 Vivado 才会真按 100MHz 约束布线。
 
 > ROMD IP 核需要在 Vivado 中重新生成，加载本目录的 `custom_int.coe` 作为初始化文件。RAM_B 可以沿用 `D_snakeDEMO.coe`（程序不读这块）。
 
@@ -183,11 +216,11 @@ PCPU U1(
 
 | 阶段 | 7-seg 数码管 | 16 LED 灯条 |
 |------|--------------|-------------|
-| 主循环（默认） | 缓慢递增的小数字 (x13, 约 2.5 次/秒) | 一只灯由 LED0 → LED15 跑马灯滚动 (约 2.5 次/秒) |
+| 主循环（默认） | 缓慢递增的小数字 (x13, 约 1.6 次/秒, 用 0xF0000 次内循环延时) | 一只灯由 LED0 → LED15 跑马灯滚动 (约 1.6 次/秒) |
 | **按下 BTNU 瞬间** | **跳成 `CAFE00xx`（xx = 累计中断次数）** | **全部 16 灯齐亮 (`FFFF`)** |
 | ISR 退出后 | 立刻恢复主循环递增 | 立刻恢复跑马灯 |
 
-中断状态停留约 **0.5 秒**（ISR 内部软件延时），所以不论按多快都看得清。
+中断状态停留约 **2 秒**（ISR 内部 0x300000 次软件延时），不论按多快都来得及看清。
 
 ### 程序结构
 
@@ -260,7 +293,7 @@ PCPU U1(
 | 0x1C | `00D5A023` | `sw x13, 0(x11)` | 7-seg ← x13 |
 | 0x20 | `00A7A023` | `sw x10, 0(x15)` | LED ← x10 |
 | 0x24 | `00000813` | `addi x16, x0, 0` | delay 重置 |
-| 0x28 | `000A08B7` | `lui x17, 0xA0` | delay 上限 |
+| 0x28 | `000F08B7` | `lui x17, 0xF0` | 主循环 delay 上限 (~630ms) |
 | 0x2C | `00180813` | `addi x16, x16, 1` | delay ++ |
 | 0x30 | `FF181EE3` | `bne x16, x17, -4` | delay loop |
 | 0x34 | `00151513` | `slli x10, x10, 1` | 跑马灯左移 |
@@ -276,7 +309,7 @@ PCPU U1(
 | 0x90 | `FFF00913` | `addi x18, x0, -1` | 0xFFFFFFFF |
 | 0x94 | `0127A023` | `sw x18, 0(x15)` | **★ LED ← FFFF** |
 | 0x98 | `00000993` | `addi x19, x0, 0` | ISR delay 重置 |
-| 0x9C | `000C0A37` | `lui x20, 0xC0` | ISR delay 上限 |
+| 0x9C | `00300A37` | `lui x20, 0x300` | ISR delay 上限 (~2.0s, 让 CAFE 停留久一些) |
 | 0xA0 | `00198993` | `addi x19, x19, 1` | ISR delay ++ |
 | 0xA4 | `FF499EE3` | `bne x19, x20, -4` | ISR delay loop |
 | 0xA8 | `00062423` | `sw x0, 8(x12)` | **★ MRET** |
@@ -312,7 +345,7 @@ PCPU U1(
 | 5 | `SW2=1`，`SW7..5=010` | 按 BTNU，慢慢看 | ISR 几条机器码依次出现：`00170713 → CAFE0937 → 00E90933 → 0125A023 → FFF00913 → 0127A023 → … → 00062423` | 与 [`custom_int.s`](custom_int.s) 反汇编对应 |
 | 6 | `SW7..5=100` | — | `Adder_out` 显示 `sw` 目标地址：主循环时 `0xE000_0000`/`0xF000_0000` 交替；按 BTNU 时短暂看到 `0xD000_0008`（MRET 地址，但 mem_w 已被内部抑制） | 总线流量正确；CSR 写不溢出 |
 
-**故障诊断：**
+**故障诊断（v2 后大多数旧问题已修复，下表只列残留可能性）：**
 
 - **按 BTNU 完全没反应（7-seg 不 flash, LED 不全亮）**：
   1. 确认 `custom_int.coe` 已写进 ROMD IP（在 Vivado IP Sources 里 Re-customize 选这个 coe + Generate）。
@@ -321,7 +354,12 @@ PCPU U1(
   4. 确认 BTNU 物理引脚 = M18（[icf.xdc](icf.xdc) 第 73 行），按上面那颗"上"键，不是左/右/中/下。
 - **按 BTNU 后 CPU 死锁（不再跑主循环）**：ISR 缺 MRET。确认 `0xA8` 是 `00062423`（sw x0, 8(x12)）。
 - **数码管出现非 `CAFE` 的怪值**：可能是 CSR 写漏到外部总线，触发了 MIO_BUS 误译码。检查 [PCPU.v](PCPU.v) 第 525 行 `EX_MEM_mem_w <= ID_EX_mem_w && !ex_is_csr_write` 与第 528 行 `EX_MEM_is_store` 同款保护是否存在。
-- **慢档按 BTNU 偶尔不响应**：慢档 `Clk_CPU ≈ 3 Hz`，每拍 333 ms。按键持续时间 < 333 ms 就可能错过上升沿采样窗口。多按一会、按到下次 posedge 即可。快档下 1 拍 = 160 ns，按一下必有 ~60 万拍都是高电平，绝对不会丢。
+- **快档下按 BTNU 偶尔不响应 / PC 跳错（v1 老问题，v2 已修）**：v1 在 `Clk_CPU` 域直接采异步按键 + xdc 时钟周期写错（100ns 应是 10ns），导致：
+  - 机械按键 5–20ms 抖动被边沿检测误拆成多个伪脉冲（或刚好夹缝中漏掉一次）；
+  - Vivado 按 10MHz 约束布线，某些路径实际跑 100MHz 时压在边界 → 偶发抽搐。
+  - 修复：[PCPU_TOP.v](PCPU_TOP.v) v2 加了 21ms 消抖 + 100MHz 同源边沿 + 500ms 拉宽 + 2-FF 跨时钟同步；[icf.xdc](icf.xdc) `create_clock` 周期由 100.00 改成 10.00。
+- **CAFE 闪一下就过去了（v1 老问题，v2 已修）**：v1 ISR 延时 0xC0000 ≈ 500ms。v2 改成 0x300000 ≈ 2.0 秒，且寄存器分工严格隔离，不会因为按多次连按搞乱 x16/x17 主循环 delay loop。
+- **慢档按 BTNU 偶尔不响应（部分缓解）**：慢档 `Clk_CPU ≈ 3 Hz`，每拍 333 ms。v2 把 INT 请求拉宽到 500ms，**保证至少 1 个 `Clk_CPU` posedge 命中**；但如果你 0.5 秒内连按两次，第二次会被第一次"吃掉"（int_req 一直高，没有新的上升沿）。慢档下间隔 ≥ 0.6 秒按即可。
 
 ---
 
@@ -339,7 +377,8 @@ PCPU U1(
 | 数码管 `data0` | 进度码 | 进度码 | 主循环计数器 x13（被 ISR 临时覆盖为 `CAFE00xx`） |
 | LED 16 位 | testac 进度低 16 位 | testac 进度低 16 位 | **主循环跑马灯位 x10 / ISR 时全亮 `FFFF`** |
 | 验证方式 | 看 "AC123456" | 看 "AC123456" | **按 BTNU → 7-seg 闪 `CAFE00xx` + LED 全亮** |
-| 顶层新增逻辑 | — | RAM 写保护门控 | + BTN1 上升沿检测 (`btn1_d`, `int_pulse`) |
+| 顶层新增逻辑 | — | RAM 写保护门控 | + **完整中断 IO 链路**：消抖 (clk 域 ~21ms) + 100MHz 同源边沿 + 500ms 拉宽 + 2-FF 跨时钟同步器 + Clk_CPU 域边沿 |
+| 时钟约束 (xdc) | `-period 100.00` (10MHz, **错的**) | 同 P1 | **`-period 10.00`** (100MHz, 修正) |
 | 流水线损失 | — | 分支 2 拍、load-use 1 拍 | + 进入中断 1 拍、MRET 2 拍 |
 
-> **核心一句话**：Project 3 只在 PCPU 内部追加 ~60 行硬件（CSR + 状态机）、在 TOP 加 6 行（BTN 上升沿），把 Project 2 升级成具备精确单层中断的最小可用 RISC-V CPU；自定义小程序通过 memory-mapped CSR 控制中断，并演示了"主循环 + ISR 互不干扰"的经典使用模式。
+> **核心一句话**：Project 3 在 PCPU 内部追加 ~60 行硬件（CSR + 中断状态机）、在 TOP 加 ~50 行（消抖 + 拉宽 + 双 FF 同步 + 双边沿检测）、并修了 xdc 的 100MHz 时钟约束，把 Project 2 升级成具备**精确单层中断 + 可靠按键中断源**的最小可用 RISC-V CPU；自定义小程序通过 memory-mapped CSR 控制中断，演示"主循环跑马灯 / ISR `CAFE` 全亮"的强对比效果。

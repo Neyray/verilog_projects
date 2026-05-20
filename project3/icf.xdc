@@ -1,6 +1,8 @@
 # Clock signal
 set_property -dict { PACKAGE_PIN E3    IOSTANDARD LVCMOS33 } [get_ports { clk }]; #IO_L12P_T1_MRCC_35 Sch=clk100mhz
-create_clock -add -name sys_clk_pin -period 100.00 -waveform {0 50} [get_ports {clk}];
+# 板载 100 MHz 主时钟: 周期 10.00 ns (旧版误写成 100.00ns→等价 10MHz, 会让 Vivado
+# 按 10MHz 来做时序分析, 实际 100MHz 跑时某些路径压在边缘 → 板上偶发抽搐)
+create_clock -add -name sys_clk_pin -period 10.00 -waveform {0 5} [get_ports {clk}];
 set_property -dict { PACKAGE_PIN C12   IOSTANDARD LVCMOS33 } [get_ports { rstn }]; #IO_L3P_T0_DQS_AD1P_15 Sch=cpu_resetn
 set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets sw_i_IBUF[15]];#add for temp
 # 原行 "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets BTNC_IBUF]" 已删除：

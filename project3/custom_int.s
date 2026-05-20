@@ -40,7 +40,7 @@
 
 # 软件延时 ~ 400ms (使 7-seg 计数 / 跑马灯肉眼可见)
 0x24:  addi  x16, x0, 0            # 00000813
-0x28:  lui   x17, 0xA0             # 000A08B7   x17 = 0xA0000 (≈655K iter)
+0x28:  lui   x17, 0xF0             # 000F08B7   x17 = 0xF0000 (≈983K iter ≈ 630ms)
 0x2C:  addi  x16, x16, 1           # 00180813
 0x30:  bne   x16, x17, -4          # FF181EE3   loop back to 0x2C
 
@@ -67,7 +67,7 @@
 
 # ISR 延时 ~ 500ms (让醒目特征停留够长, 肉眼能清楚看见)
 0x98:  addi  x19, x0, 0            # 00000993
-0x9C:  lui   x20, 0xC0             # 000C0A37   x20 = 0xC0000 (≈786K iter)
+0x9C:  lui   x20, 0x300            # 00300A37   x20 = 0x300000 (≈3.1M iter ≈ 2.0s)
 0xA0:  addi  x19, x19, 1           # 00198993
 0xA4:  bne   x19, x20, -4          # FF499EE3   loop back to 0xA0
 

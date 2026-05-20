@@ -93,16 +93,81 @@ wire [31:0] none;
 
 // ===================== 模块实例化 =====================
 
-// ---------- 中断源：BTN_out[1] 上升沿检测（Clk_CPU 域）----------
-//   - Enter 已经在系统时钟 clk 域做了同步/消抖，BTN_out[1] 可直接采样
-//   - 这里用 1 拍延迟与 BTN_out[1] 异或得到 1-CPU-周期 INT 脉冲，
-//     防止按住按钮时持续触发中断
-reg btn1_d;
-always @(posedge Clk_CPU or posedge rst_i) begin
-    if (rst_i) btn1_d <= 1'b0;
-    else       btn1_d <= BTN_out[1];
+// =============================================================
+// 中断源链路 (v2)
+//   原 v1 直接在 Clk_CPU 域采样异步 BTN_out[1], 没消抖、没跨时钟同步,
+//   实际板上按键抖动 5~20ms, 既会漏触发也会被拆成多个伪脉冲。
+//
+//   新链路 (按数据流方向):
+//     BTN_out[1]
+//        └─► [A] 100MHz 系统时钟域消抖 (~20ms)        →  btn1_dbnc
+//        └─► [B] 100MHz 域上升沿检测                 →  btn1_rising  (1 个 clk 拍宽)
+//        └─► [C] 拉宽成 ~500ms 的 level int_req      →  保证慢档 Clk_CPU 也能采到
+//        └─► [D] Clk_CPU 域 2-FF 同步器              →  int_req_s1
+//        └─► [E] Clk_CPU 域上升沿检测                →  int_pulse (1 Clk_CPU 拍宽)
+//        └─► PCPU.INT
+// =============================================================
+
+// [A] 消抖: 输入与稳态相等就清零计数; 否则计数累加, 累计 ~21ms 都不变才更新稳态
+reg [20:0] dbnc_cnt;
+reg        btn1_dbnc;
+always @(posedge clk or posedge rst_i) begin
+    if (rst_i) begin
+        dbnc_cnt  <= 21'd0;
+        btn1_dbnc <= 1'b0;
+    end else if (BTN_out[1] == btn1_dbnc) begin
+        dbnc_cnt <= 21'd0;
+    end else begin
+        dbnc_cnt <= dbnc_cnt + 21'd1;
+        if (&dbnc_cnt) btn1_dbnc <= BTN_out[1];
+    end
 end
-wire int_pulse = BTN_out[1] & ~btn1_d;   // 仅按下瞬间为 1
+
+// [B] 100MHz 域上升沿检测 (源时钟域内做边沿一定不丢)
+reg btn1_dbnc_d;
+always @(posedge clk or posedge rst_i) begin
+    if (rst_i) btn1_dbnc_d <= 1'b0;
+    else       btn1_dbnc_d <= btn1_dbnc;
+end
+wire btn1_rising = btn1_dbnc & ~btn1_dbnc_d;   // 1 clk 拍宽
+
+// [C] 拉宽成 ~500ms level (慢档 Clk_CPU 周期 ≈333ms 也保证至少有 1 次 posedge 命中)
+reg [25:0] req_cnt;
+reg        int_req;
+always @(posedge clk or posedge rst_i) begin
+    if (rst_i) begin
+        req_cnt <= 26'd0;
+        int_req <= 1'b0;
+    end else if (btn1_rising) begin
+        int_req <= 1'b1;
+        req_cnt <= 26'd0;
+    end else if (int_req) begin
+        if (req_cnt == 26'd50_000_000)         // 100MHz × 0.5s
+            int_req <= 1'b0;
+        else
+            req_cnt <= req_cnt + 26'd1;
+    end
+end
+
+// [D] 跨时钟到 Clk_CPU 域: 标准 2-FF 同步器
+reg int_req_s0, int_req_s1;
+always @(posedge Clk_CPU or posedge rst_i) begin
+    if (rst_i) begin
+        int_req_s0 <= 1'b0;
+        int_req_s1 <= 1'b0;
+    end else begin
+        int_req_s0 <= int_req;
+        int_req_s1 <= int_req_s0;
+    end
+end
+
+// [E] Clk_CPU 域上升沿检测, 输出 1 个 Clk_CPU 拍的 INT 脉冲
+reg int_req_d;
+always @(posedge Clk_CPU or posedge rst_i) begin
+    if (rst_i) int_req_d <= 1'b0;
+    else       int_req_d <= int_req_s1;
+end
+wire int_pulse = int_req_s1 & ~int_req_d;   // 仅按下瞬间为 1
 
 // ---------- U1: PCPU（流水线 + 中断版） ----------
 PCPU U1(

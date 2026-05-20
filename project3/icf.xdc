@@ -3,7 +3,9 @@ set_property -dict { PACKAGE_PIN E3    IOSTANDARD LVCMOS33 } [get_ports { clk }]
 create_clock -add -name sys_clk_pin -period 100.00 -waveform {0 50} [get_ports {clk}];
 set_property -dict { PACKAGE_PIN C12   IOSTANDARD LVCMOS33 } [get_ports { rstn }]; #IO_L3P_T0_DQS_AD1P_15 Sch=cpu_resetn
 set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets sw_i_IBUF[15]];#add for temp
- set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets BTNC_IBUF] 
+# 原行 "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets BTNC_IBUF]" 已删除：
+# 设计里没有 BTNC 这个端口（按键统一为 btn_i[4:0]），get_nets 返回空对象会
+# 触发 [Common 17-55] 'set_property' expects at least one object。
 
 # 7seg
 set_property -dict { PACKAGE_PIN T10   IOSTANDARD LVCMOS33 } [get_ports { disp_seg_o[0] }]; #IO_L24N_T3_A00_D16_14 Sch=ca
@@ -63,12 +65,15 @@ set_property -dict { PACKAGE_PIN V10   IOSTANDARD LVCMOS33 } [get_ports { sw_i[1
 
  
  
-set_property -dict { PACKAGE_PIN C12   IOSTANDARD LVCMOS33 } [get_ports { CPU_RESETN }]; #IO_L3P_T0_DQS_AD1P_15 Sch=cpu_resetn
-set_property -dict { PACKAGE_PIN N17   IOSTANDARD LVCMOS33 } [get_ports { BTNC }]; #IO_L9P_T1_DQS_14 Sch=btnc
-set_property -dict { PACKAGE_PIN M18   IOSTANDARD LVCMOS33 } [get_ports { BTNU }]; #IO_L4N_T0_D05_14 Sch=btnu
-set_property -dict { PACKAGE_PIN P17   IOSTANDARD LVCMOS33 } [get_ports { BTNL }]; #IO_L12P_T1_MRCC_14 Sch=btnl
-set_property -dict { PACKAGE_PIN M17   IOSTANDARD LVCMOS33 } [get_ports { BTNR }]; #IO_L10N_T1_D15_14 Sch=btnr
-set_property -dict { PACKAGE_PIN P18   IOSTANDARD LVCMOS33 } [get_ports { BTND }]; #IO_L9N_T1_DQS_D13_14 Sch=btnd
+## Buttons (5 个用户按键 → btn_i[4:0])
+##   - 顶层端口实际是 btn_i[4:0]，必须用 btn_i[N] 而不是 BTNC/BTNU/...
+##   - rstn 已在第 4 行绑到 C12 (cpu_resetn)，这里不再重复
+##   - btn_i[1] (BTNU) 在 Project 3 中被 PCPU_TOP 当作中断请求源
+set_property -dict { PACKAGE_PIN N17   IOSTANDARD LVCMOS33 } [get_ports { btn_i[0] }]; #IO_L9P_T1_DQS_14   Sch=btnc
+set_property -dict { PACKAGE_PIN M18   IOSTANDARD LVCMOS33 } [get_ports { btn_i[1] }]; #IO_L4N_T0_D05_14   Sch=btnu  <-- INT source (Project 3)
+set_property -dict { PACKAGE_PIN P17   IOSTANDARD LVCMOS33 } [get_ports { btn_i[2] }]; #IO_L12P_T1_MRCC_14 Sch=btnl
+set_property -dict { PACKAGE_PIN M17   IOSTANDARD LVCMOS33 } [get_ports { btn_i[3] }]; #IO_L10N_T1_D15_14  Sch=btnr
+set_property -dict { PACKAGE_PIN P18   IOSTANDARD LVCMOS33 } [get_ports { btn_i[4] }]; #IO_L9N_T1_DQS_D13_14 Sch=btnd
 
 
 

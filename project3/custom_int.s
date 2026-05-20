@@ -1,76 +1,140 @@
-# custom_int.s — Project 3 中断演示小程序 v2
+    .option norvc
+    .text
+    .globl _start
+
+# custom_int.s -- Project 3 中断序列锁小游戏 v3
 #
-# === 现象 ===
-# 上电后:
-#   • 8 位 7 段数码管: 缓慢递增的小数字 (主计数器 x13, 大约每 0.4 秒 +1)
-#   • 16 个 LED:      一只 LED 由 LED0 → LED15 跑马灯式左移, 周期约 0.4s × 16
+# BTNU/BTN1 是本程序唯一的实时输入：每次稳定按下都会进入一次 ISR。
+# 主循环显示一个“序列锁”小游戏：
+#   LED[7:0]  : 移动光标，按 1、2、4、8、16 循环
+#   LED[15:8] : 当前目标位
+# 当低 8 位光标与高 8 位目标重合时按下 BTNU。目标顺序固定为：
+#   0x02 -> 0x08 -> 0x01 -> 0x10
+# 按对会推进当前进度；按错会增加罚分并把进度重置为 0。
+# 连续完成四步后，胜利计数器加 1。
 #
-# 按一下 BTNU (板上"上"按键, 对应 btn_i[1]):
-#   • 7 段瞬间跳成 "CAFE00xx" (xx = ISR 调用次数)
-#   • 16 个 LED 全部点亮 (0xFFFF)
-#   • 该状态停留约 0.5 秒, 然后自动恢复主循环
-#   • 再按一次 → "CAFE0002"; 再按 → "CAFE0003" ...
-#
-# === 寄存器分工 (主循环 / ISR 互不相干, 不需要软件保存现场) ===
-#   x10 — 主循环 LED 跑马灯位模式 (1 → 2 → 4 → ... → 0x8000 → 1 → ...)
-#   x11 — 0xE000_0000  数码管基址
-#   x12 — 0xD000_0000  CSR 基址
-#   x13 — 主循环计数器
-#   x14 — ISR 计数器 (中断次数)
-#   x15 — 0xF000_0000  LED 基址
-#   x16, x17, x21 — 主循环 scratch (delay loop + 翻转检查)
-#   x18, x19, x20 — ISR  scratch (显示值 + delay loop)
+# ISR 内没有软件延时，只更新游戏状态并写 MRET。
+# 因此中断处理结束后能很快回到被打断的主循环状态。
 
-# ============================================================
-#  初始化 (PC = 0x00 ~ 0x18)
-# ============================================================
-0x00:  lui   x11, 0xE0000          # E00005B7   x11 = 0xE000_0000  (7-seg)
-0x04:  lui   x12, 0xD0000          # D0000637   x12 = 0xD000_0000  (CSR)
-0x08:  lui   x15, 0xF0000          # F00007B7   x15 = 0xF000_0000  (LED)
-0x0C:  addi  x10, x0, 1            # 00100513   LED 跑马灯起始位 = bit0
-0x10:  addi  x13, x0, 0            # 00000693   主计数器 = 0
-0x14:  addi  x14, x0, 0            # 00000713   ISR 计数器 = 0
-0x18:  sw    x0,  0(x12)           # 00062023   ★ mie ← 1 (开中断)
+_start:
+    lui   x11, 0xe0000          # 7-seg base = 0xE000_0000
+    lui   x12, 0xd0000          # CSR base   = 0xD000_0000
+    lui   x15, 0xf0000          # LED base   = 0xF000_0000
+    addi  x10, x0, 1            # cursor mask (low LED group)
+    addi  x13, x0, 0            # stage: 0..3
+    addi  x14, x0, 0            # penalty counter
+    addi  x16, x0, 0            # win counter
+    addi  x23, x0, 0            # flash countdown
+    addi  x24, x0, 0            # flash kind: 1=OK, 2=BAD, 3=WIN
+    sw    x0, 0(x12)            # mie <- 1
+    jal   x0, main_loop
 
-# ============================================================
-#  主循环 (PC = 0x1C ~ 0x48)
-# ============================================================
-0x1C:  sw    x13, 0(x11)           # 00D5A023   7-seg ← 主计数 x13
-0x20:  sw    x10, 0(x15)           # 00A7A023   LED   ← 跑马灯位
+    .org 0x80
+isr:
+    # Recompute expected mask from stable stage x13. Do not depend on the
+    # main loop's temporary target register, because INT may arrive mid-update.
+    addi  x28, x0, 2            # stage 0 target = 0x02
+    beq   x13, x0, isr_compare
+    addi  x29, x0, 1
+    beq   x13, x29, isr_target_1
+    addi  x29, x0, 2
+    beq   x13, x29, isr_target_2
+    addi  x28, x0, 16           # stage 3 target = 0x10
+    jal   x0, isr_compare
+isr_target_1:
+    addi  x28, x0, 8            # stage 1 target = 0x08
+    jal   x0, isr_compare
+isr_target_2:
+    addi  x28, x0, 1            # stage 2 target = 0x01
 
-# 软件延时 ~ 400ms (使 7-seg 计数 / 跑马灯肉眼可见)
-0x24:  addi  x16, x0, 0            # 00000813
-0x28:  lui   x17, 0xF0             # 000F08B7   x17 = 0xF0000 (≈983K iter ≈ 630ms)
-0x2C:  addi  x16, x16, 1           # 00180813
-0x30:  bne   x16, x17, -4          # FF181EE3   loop back to 0x2C
+isr_compare:
+    bne   x10, x28, isr_wrong
 
-# 跑马灯左移; 当 x10 == 0x10000 (越过 LED15) 时回卷到 bit0
-0x34:  slli  x10, x10, 1           # 00151513   x10 <<= 1
-0x38:  lui   x21, 0x10             # 00010AB7   x21 = 0x10000 (越界标记)
-0x3C:  bne   x10, x21, +8          # 01551463   if (x10 != 0x10000) skip reset
-0x40:  addi  x10, x0, 1            # 00100513   else x10 = 1
+isr_correct:
+    addi  x13, x13, 1
+    addi  x28, x0, 4
+    bne   x13, x28, isr_step_ok
+    addi  x16, x16, 1           # full sequence completed
+    addi  x13, x0, 0
+    addi  x23, x0, 4
+    addi  x24, x0, 3            # WIN flash
+    sw    x0, 8(x12)            # MRET
 
-0x44:  addi  x13, x13, 1           # 00168693   主计数器++
-0x48:  jal   x0, -44               # FD5FF06F   回到 0x1C
+isr_step_ok:
+    addi  x23, x0, 2
+    addi  x24, x0, 1            # OK flash
+    sw    x0, 8(x12)            # MRET
 
-# 0x4C..0x7C: NOP (0x00000013) 填充
+isr_wrong:
+    addi  x14, x14, 1           # penalty++
+    addi  x13, x0, 0            # reset sequence progress
+    addi  x23, x0, 3
+    addi  x24, x0, 2            # BAD flash
+    sw    x0, 8(x12)            # MRET
 
-# ============================================================
-#  中断服务例程 ISR (PC = 0x80, 由 PCPU 内部 MTVEC 硬编码指定)
-# ============================================================
-0x80:  addi  x14, x14, 1           # 00170713   ISR 计数++
-0x84:  lui   x18, 0xCAFE0          # CAFE0937   x18 = 0xCAFE_0000  ←★ 醒目前缀
-0x88:  add   x18, x18, x14         # 00E90933   x18 = 0xCAFE_0000 + x14
-0x8C:  sw    x18, 0(x11)           # 0125A023   ★ 7-seg ← "CAFE00xx"
-0x90:  addi  x18, x0, -1           # FFF00913   x18 = 0xFFFF_FFFF
-0x94:  sw    x18, 0(x15)           # 0127A023   ★ LED ← 0xFFFF (16 灯齐亮)
+    .org 0x100
+main_loop:
+    # target mask x18 = sequence[stage]
+    addi  x18, x0, 2
+    beq   x13, x0, target_done
+    addi  x30, x0, 1
+    beq   x13, x30, target_1
+    addi  x30, x0, 2
+    beq   x13, x30, target_2
+    addi  x18, x0, 16
+    jal   x0, target_done
+target_1:
+    addi  x18, x0, 8
+    jal   x0, target_done
+target_2:
+    addi  x18, x0, 1
 
-# ISR 延时 ~ 500ms (让醒目特征停留够长, 肉眼能清楚看见)
-0x98:  addi  x19, x0, 0            # 00000993
-0x9C:  lui   x20, 0x300            # 00300A37   x20 = 0x300000 (≈3.1M iter ≈ 2.0s)
-0xA0:  addi  x19, x19, 1           # 00198993
-0xA4:  bne   x19, x20, -4          # FF499EE3   loop back to 0xA0
+target_done:
+    slli  x25, x18, 8           # high byte = target
+    or    x25, x25, x10         # low byte  = cursor
+    sw    x25, 0(x15)
 
-0xA8:  sw    x0,  8(x12)           # 00062423   ★ MRET (PC ← mepc, mie ← 1)
+    beq   x23, x0, show_normal
+    addi  x30, x0, 1
+    beq   x24, x30, show_ok
+    addi  x30, x0, 2
+    beq   x24, x30, show_bad
 
-# 0xAC+: NOP 填充 —— ISR 必须以 MRET 结束, 否则会落入 NOP 区, 程序行为不可控
+show_win:
+    lui   x26, 0x600d0          # 600D00ww
+    or    x26, x26, x16
+    jal   x0, store_display
+show_ok:
+    lui   x26, 0xc0de0          # C0DE000s
+    or    x26, x26, x13
+    jal   x0, store_display
+show_bad:
+    lui   x26, 0xbad00          # BAD000pp
+    or    x26, x26, x14
+    jal   x0, store_display
+show_normal:
+    lui   x26, 0xa0000          # A000ppss: penalty in byte1, stage in byte0
+    slli  x27, x14, 8
+    or    x27, x27, x13
+    or    x26, x26, x27
+
+store_display:
+    sw    x26, 0(x11)
+    beq   x23, x0, delay_start
+    addi  x23, x23, -1
+
+delay_start:
+    addi  x8, x0, 0
+    lui   x9, 0x60              # visible frame delay (~0.25s at fast CPU)
+delay_loop:
+    addi  x8, x8, 1
+    bne   x8, x9, delay_loop
+
+    slli  x30, x10, 1           # compute next cursor in scratch first
+    addi  x31, x0, 32
+    bne   x30, x31, use_shifted_cursor
+    addi  x10, x0, 1
+    jal   x0, main_loop
+use_shifted_cursor:
+    add   x10, x30, x0
+    jal   x0, main_loop

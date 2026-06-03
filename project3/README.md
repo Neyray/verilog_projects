@@ -6,9 +6,9 @@
 
 | `mcause` | 中断类型 | 来源 | 板上表现 | 作用 |
 |----------|----------|------|----------|------|
-| `1` | BTN1 游戏确认中断 | `BTNU / btn_i[1]` | `C0DE000s`、`BAD000pp`、`600D00ww` | 小程序确认按键 |
+| `1` | BTN1 游戏确认中断 | `BTNC/BTNU / btn_i[0]/btn_i[1]` | `C0DE000s`、`BAD000pp`、`600D00ww` | 小程序确认按键 |
 | `2` | timer 周期中断 | `PCPU_TOP.v` 内部计时器 | `710E00tt` | 证明系统能主动周期中断 |
-| `3` | BTNL 辅助中断 | `BTNL / btn_i[2]` | `A11000aa` | 证明可扩展第三类外部中断 |
+| `3` | BTNL 辅助中断 | `BTNL/BTNR / btn_i[2]/btn_i[3]` | `A11000aa` | 证明可扩展第三类外部中断 |
 
 正常态数码管显示 `A0ccppss`：
 
@@ -25,7 +25,7 @@
 | 文件 | 作用 |
 |------|------|
 | `PCPU.v` | 五级流水线 CPU，新增 `mie / mepc / mcause / int_pending[2:0]` 和 CSR 读写 |
-| `PCPU_TOP.v` | 顶层 SoC，产生三路 `INT[2:0]`：BTN1、timer、BTNL |
+| `PCPU_TOP.v` | 顶层 SoC，产生三路 `INT[2:0]`：BTN1/BTNC/BTNU、timer、BTNL/BTNR |
 | `custom_int.s` | 自定义程序源码，ISR 读取 `mcause` 后分发三类中断 |
 | `custom_int.coe` | `custom_int.s` 对应的 ROM 初始化文件 |
 | `clk_div.v` | CPU 快/慢档时钟，`SW2=0` 快档，`SW2=1` 慢档 |
@@ -36,9 +36,9 @@
 ## 整体结构
 
 ```text
-BTN1/BTNU ── 消抖 ─ 边沿 ─ 事件 toggle ─ 2FF 同步 ┐
+BTN1/BTNC/BTNU ── 消抖 ─ 边沿 ─ 事件 toggle ─ 2FF 同步 ┐
 timer     ── 计数到期产生 1 拍脉冲                ├─► INT[2:0] ─► PCPU
-BTNL      ── 消抖 ─ 边沿 ─ 事件 toggle ─ 2FF 同步 ┘
+BTNL/BTNR ── 消抖 ─ 边沿 ─ 事件 toggle ─ 2FF 同步 ┘
 
 PCPU 内部：
   INT[2:0] ─► int_pending[2:0] ─► 优先级仲裁 ─► mcause
@@ -51,7 +51,7 @@ ISR：
   lw x21, 12(x12)    # 读 0xD000_000C，也就是 mcause
   mcause=1 -> 游戏确认
   mcause=2 -> timer 计数
-  mcause=3 -> BTNL 辅助计数
+  mcause=3 -> BTNL/BTNR 辅助计数
   sw x0, 8(x12)      # 写 0xD000_0008，触发 MRET
 ```
 
@@ -59,15 +59,15 @@ ISR：
 
 ## 中断类型与验收
 
-### 类型 1：BTN1 / BTNU 游戏确认中断
+### 类型 1：BTN1 / BTNC/BTNU 游戏确认中断
 
-来源：`BTNU`，顶层端口 `btn_i[1]`。
+来源：`BTNC` 或 `BTNU`，顶层端口 `btn_i[0]` 或 `btn_i[1]`。
 
 板上验收：
 
 1. 设置 `SW7..5=000`，`SW2=0`。
 2. 复位后数码管显示 `A0000000`。
-3. LED 低 8 位光标循环移动，LED15 亮时按 `BTNU`。
+3. LED 低 8 位光标循环移动，LED15 亮时按 `BTNC` 或 `BTNU`。
 4. 按对显示 `C0DE0001`，按错显示 `BAD000pp`，完成四步显示 `600D00ww`。
 5. 正常态的 `A0ccppss` 中 `cc` 会变成 `01`，证明 `mcause=1` 被读到并显示出来。
 
@@ -76,7 +76,7 @@ ISR：
 | 功能 | 位置 |
 |------|------|
 | BTN1 原始输入映射为中断按钮 bit0 | `PCPU_TOP.v:113` |
-| BTN1/BTNL 消抖 | `PCPU_TOP.v:110-135` |
+| BTN1/BTNC/BTNU 和 BTNL/BTNR 消抖 | `PCPU_TOP.v:110-135` |
 | 按键上升沿检测 | `PCPU_TOP.v:137-143` |
 | 事件 toggle 跨时钟 | `PCPU_TOP.v:145-170` |
 | `INT[0]` 接入 CPU | `PCPU_TOP.v:189`、`PCPU_TOP.v:204` |
@@ -107,14 +107,14 @@ ISR：
 | timer 次数加一并设置显示类型 | `custom_int.s:105-109` |
 | 数码管显示 `710E00tt` | `custom_int.s:157-160` |
 
-### 类型 3：BTNL 辅助中断
+### 类型 3：BTNL/BTNR 辅助中断
 
-来源：`BTNL`，顶层端口 `btn_i[2]`。它不影响游戏状态，只证明系统还能扩展第三类外部中断。
+来源：`BTNL` 或 `BTNR`，顶层端口 `btn_i[2]` 或 `btn_i[3]`。它不影响游戏状态，只证明系统还能扩展第三类外部中断。
 
 板上验收：
 
 1. 设置 `SW7..5=000`，`SW2=0`。
-2. 按 `BTNL`。
+2. 按 `BTNL` 或 `BTNR`。
 3. 数码管短暂显示 `A1100001`，再次按显示 `A1100002`。
 4. 正常态 `A0ccppss` 中 `cc` 会变成 `03`，证明 `mcause=3` 被读到并显示出来。
 
@@ -122,12 +122,12 @@ ISR：
 
 | 功能 | 位置 |
 |------|------|
-| BTNL 原始输入映射为中断按钮 bit1 | `PCPU_TOP.v:113` |
-| BTNL 消抖/边沿/toggle | `PCPU_TOP.v:117-170` |
+| BTNL/BTNR 原始输入映射为中断按钮 bit1 | `PCPU_TOP.v:113` |
+| BTNL/BTNR 消抖/边沿/toggle | `PCPU_TOP.v:117-170` |
 | `INT[2]` 接入 CPU | `PCPU_TOP.v:189`、`PCPU_TOP.v:204` |
 | CPU 仲裁 `INT[2] -> mcause=3` | `PCPU.v:475-483` |
 | ISR 分发到 `isr_aux` | `custom_int.s:49-50` |
-| BTNL 次数加一并设置显示类型 | `custom_int.s:111-115` |
+| BTNL/BTNR 次数加一并设置显示类型 | `custom_int.s:111-115` |
 | 数码管显示 `A11000aa` | `custom_int.s:161-164` |
 
 ---
@@ -177,7 +177,7 @@ int_taken = (irq_pending_now != 3'b000) && mie && !stall && !flush && !mret_take
 |--------|-------------|----------|
 | 最高 | `INT[0]` | `1` BTN1 |
 | 中 | `INT[1]` | `2` timer |
-| 低 | `INT[2]` | `3` BTNL |
+| 低 | `INT[2]` | `3` BTNL/BTNR |
 
 仲裁实现位置：`PCPU.v:475-483`。
 
@@ -255,7 +255,7 @@ lw x21, 12(x12)     # x12 = 0xD0000000，所以地址是 0xD000000C
 | `x16` | 完成次数 win |
 | `x17` | 上一次中断类型 last cause |
 | `x19` | timer 中断次数 |
-| `x20` | BTNL 辅助中断次数 |
+| `x20` | BTNL/BTNR 辅助中断次数 |
 | `x21` | ISR 里读取的 `mcause` |
 | `x23` | 状态提示倒计时 |
 | `x24` | 状态提示类型 |
@@ -269,7 +269,7 @@ lw x21, 12(x12)     # x12 = 0xD0000000，所以地址是 0xD000000C
 | `BAD000pp` | BTN1 按错 |
 | `600D00ww` | 四步完成 |
 | `710E00tt` | timer 中断次数 |
-| `A11000aa` | BTNL 辅助中断次数 |
+| `A11000aa` | BTNL/BTNR 辅助中断次数 |
 
 ---
 
@@ -288,7 +288,7 @@ lw x21, 12(x12)     # x12 = 0xD0000000，所以地址是 0xD000000C
 
 ### 2. BTN1 中断
 
-操作：LED15 亮时按 `BTNU`。
+操作：LED15 亮时按 `BTNC` 或 `BTNU`。
 
 期望：
 
@@ -307,9 +307,9 @@ lw x21, 12(x12)     # x12 = 0xD0000000，所以地址是 0xD000000C
 - 正常态 `cc=02`
 - 说明 `mcause=2` 生效
 
-### 4. BTNL 第三类中断
+### 4. BTNL/BTNR 第三类中断
 
-操作：按 `BTNL`。
+操作：按 `BTNL` 或 `BTNR`。
 
 期望：
 
@@ -322,7 +322,7 @@ lw x21, 12(x12)     # x12 = 0xD0000000，所以地址是 0xD000000C
 
 设置：`SW2=1` 慢档，`SW7..5=111` 看 `PC_out`。
 
-操作：按 `BTNU` 或 `BTNL`。
+操作：按 `BTNC/BTNU` 或 `BTNL/BTNR`。
 
 期望：
 
@@ -366,7 +366,7 @@ lw x21, 12(x12)     # x12 = 0xD0000000，所以地址是 0xD000000C
 
 | 问题 | 文件行号 |
 |------|----------|
-| BTN1/BTNL 原始输入映射 | `PCPU_TOP.v:113` |
+| BTN1/BTNC/BTNU 和 BTNL/BTNR 原始输入映射 | `PCPU_TOP.v:113` |
 | 双按键消抖 | `PCPU_TOP.v:117-135` |
 | 按键上升沿检测 | `PCPU_TOP.v:137-143` |
 | 事件 toggle | `PCPU_TOP.v:145-150` |
@@ -389,7 +389,7 @@ lw x21, 12(x12)     # x12 = 0xD0000000，所以地址是 0xD000000C
 | 按 `mcause` 分发三类中断 | `custom_int.s:45-50` |
 | BTN1 游戏中断处理 | `custom_int.s:53-103` |
 | timer 中断处理 | `custom_int.s:105-109` |
-| BTNL 辅助中断处理 | `custom_int.s:111-115` |
+| BTNL/BTNR 辅助中断处理 | `custom_int.s:111-115` |
 | 主循环入口 `0x180` | `custom_int.s:117-118` |
 | LED15 READY 灯 | `custom_int.s:137-139` |
 | `710E00tt` 显示 | `custom_int.s:157-160` |

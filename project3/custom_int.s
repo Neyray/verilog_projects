@@ -5,14 +5,14 @@
 # custom_int.s -- Project 3 中断序列锁小游戏 v3
 #
 # Project 3 现在有三种中断：
-#   mcause=1: BTNU/BTN1 游戏确认中断
+#   mcause=1: BTNC/BTNU/BTN1 游戏确认中断
 #   mcause=2: timer 周期中断
-#   mcause=3: BTNL 辅助手动中断
+#   mcause=3: BTNL/BTNR 辅助手动中断
 # 主循环显示一个“序列锁”小游戏：
 #   LED[7:0]  : 移动光标，按 1、2、4、8、16 循环
 #   LED[12:8] : 当前目标位（高 8 位镜像）
-#   LED[15]   : READY 提示灯，亮起时按 BTNU 最稳
-# 当低 8 位光标与高 8 位目标重合、或 LED15 亮起时按下 BTNU。目标顺序固定为：
+#   LED[15]   : READY 提示灯，亮起时按 BTNC 或 BTNU 最稳
+# 当低 8 位光标与高 8 位目标重合、或 LED15 亮起时按下 BTNC/BTNU。目标顺序固定为：
 #   0x02 -> 0x08 -> 0x01 -> 0x10
 # 按对会推进当前进度；按错会增加罚分并把进度重置为 0。
 # 连续完成四步后，胜利计数器加 1。
@@ -40,7 +40,7 @@ _start:
     .org 0x80
 isr:
     # 中断服务程序：先读 mcause，再按类型分发
-    lw    x21, 12(x12)          # mcause: 1=BTN1, 2=timer, 3=BTNL
+    lw    x21, 12(x12)          # mcause: 1=BTN1, 2=timer, 3=BTNL/BTNR
     add   x17, x21, x0          # normal display shows last interrupt cause
     addi  x22, x0, 1
     beq   x21, x22, isr_button
@@ -135,7 +135,7 @@ target_done:
     slli  x25, x18, 8           # high byte = target
     or    x25, x25, x10         # low byte  = cursor
     bne   x10, x18, store_led
-    lui   x30, 0x8              # LED15 = READY: press BTNU now
+    lui   x30, 0x8              # LED15 = READY: press BTNC/BTNU now
     or    x25, x25, x30
 store_led:
     sw    x25, 0(x15)

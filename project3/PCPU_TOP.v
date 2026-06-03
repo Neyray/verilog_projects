@@ -3,7 +3,7 @@
 // Module Name: PCPU_TOP  (Project 3 — 流水线 + 中断 + 自定义小程序)
 // Description: 在 Project 2 顶层基础上新增中断源：
 //   1. 指令ROM 加载 custom_int.coe（自定义中断演示程序，主循环 + ISR）
-//   2. 三路中断源：BTN1 游戏确认、timer 周期中断、BTNL 辅助中断
+//   2. 三路中断源：BTN1 游戏确认、timer 周期中断、BTNL/BTNR 辅助中断
 //   3. PCPU.INT 端口由原来的 1'b0 改为 int_sources[2:0]
 //   4. 其余外设、总线、显示通道与 Project 2 完全相同
 //
@@ -98,7 +98,7 @@ wire [31:0] none;
 //   实际板上按键抖动 5~20ms, 既会漏触发也会被拆成多个伪脉冲。
 //
 //   新链路 (按数据流方向):
-//     BTN_out[1] / BTN_out[2]
+//     (BTN_out[0] | BTN_out[1]) / (BTN_out[2] | BTN_out[3])
 //        └─► [A] 100MHz 系统时钟域消抖 (~5ms)         →  btn1_dbnc
 //        └─► [B] 100MHz 域上升沿检测                 →  btn1_rising  (1 个 clk 拍宽)
 //        └─► [C] 每次按下翻转一次事件位 btn1_event_tog
@@ -107,10 +107,11 @@ wire [31:0] none;
 //        └─► PCPU.INT
 // =============================================================
 
-localparam BTN_DBNC_MAX = 20'd500_000;  // 100MHz x 5ms
+localparam BTN_DBNC_MAX    = 20'd500_000;    // 100MHz x 5ms
+localparam BTN_LOCKOUT_MAX = 24'd10_000_000; // 100MHz x 100ms, block bounce/repeat
 
 // [A] 消抖: 输入与稳态相等就清零计数; 否则计数累加, 累计 ~5ms 都不变才更新稳态
-wire [1:0] irq_btn_raw = {BTN_out[2], BTN_out[1]};  // [0]=BTN1, [1]=BTNL
+wire [1:0] irq_btn_raw = {BTN_out[2] | BTN_out[3], BTN_out[0] | BTN_out[1]};  // [0]=BTN1: BTNC/BTNU, [1]=BTNL/BTNR
 reg [19:0] dbnc_cnt [0:1];
 reg [1:0]  btn_dbnc;
 integer irq_btn_i;
@@ -142,11 +143,36 @@ always @(posedge clk or posedge rst_i) begin
 end
 wire [1:0] btn_rising = btn_dbnc & ~btn_dbnc_d;   // 1 clk 拍宽
 
-// [C] 事件翻转: 避免 500ms level 期间的第二次按键被合并掉
-reg [1:0] btn_event_tog;
+// [C] 事件翻转 + 抖动锁定。
+//     原始上升沿先触发一次, 避免按键因为消抖窗口/短按被漏掉;
+//     100ms lockout 会屏蔽机械抖动, 也会屏蔽随后到来的消抖上升沿。
+reg [1:0] irq_btn_raw_d;
 always @(posedge clk or posedge rst_i) begin
-    if (rst_i) btn_event_tog <= 2'b00;
-    else       btn_event_tog <= btn_event_tog ^ btn_rising;
+    if (rst_i) irq_btn_raw_d <= 2'b00;
+    else       irq_btn_raw_d <= irq_btn_raw;
+end
+wire [1:0] raw_rising = irq_btn_raw & ~irq_btn_raw_d;
+wire [1:0] btn_press_event = btn_rising | raw_rising;
+
+reg [1:0]  btn_event_tog;
+reg [23:0] irq_lock_cnt [0:1];
+integer irq_evt_i;
+always @(posedge clk or posedge rst_i) begin
+    if (rst_i) begin
+        btn_event_tog <= 2'b00;
+        for (irq_evt_i = 0; irq_evt_i < 2; irq_evt_i = irq_evt_i + 1) begin
+            irq_lock_cnt[irq_evt_i] <= 24'd0;
+        end
+    end else begin
+        for (irq_evt_i = 0; irq_evt_i < 2; irq_evt_i = irq_evt_i + 1) begin
+            if (btn_press_event[irq_evt_i] && (irq_lock_cnt[irq_evt_i] == 24'd0)) begin
+                btn_event_tog[irq_evt_i] <= ~btn_event_tog[irq_evt_i];
+                irq_lock_cnt[irq_evt_i] <= BTN_LOCKOUT_MAX;
+            end else if (irq_lock_cnt[irq_evt_i] != 24'd0) begin
+                irq_lock_cnt[irq_evt_i] <= irq_lock_cnt[irq_evt_i] - 24'd1;
+            end
+        end
+    end
 end
 
 // [D] 跨时钟到 Clk_CPU 域: 标准 2-FF 同步器
@@ -201,7 +227,7 @@ PCPU U1(
     .Data_out(Data_out),
     .dm_ctrl(dm_ctrl),
     .CPU_MIO(CPU_MIO),
-    .INT(int_sources)           // ★ 三路中断：1=BTN1, 2=timer, 3=BTNL
+    .INT(int_sources)           // ★ 三路中断：1=BTN1, 2=timer, 3=BTNL/BTNR
 );
 
 // ---------- U2: ROMD (指令ROM IP核) ----------

@@ -10,14 +10,15 @@
 //   3. 控制冒险: 分支/跳转在 EX 阶段判断，冲刷 IF/ID 和 ID/EX (Flush 2条)
 //
 // 中断 (Interrupt) 机制:
-//   - 内部 CSR 寄存器: mie (全局中断使能), mepc (返回地址), int_pending (锁存)
+//   - 内部 CSR 寄存器: mie (全局中断使能), mepc (返回地址), mcause (中断类型), int_pending (锁存)
 //   - 中断入口 MTVEC = 32'h0000_0080（ISR 必须放在 0x80）
-//   - 中断进入: int_pending && mie && !stall && !flush && !mret_taken
-//     → mepc ← PC, mie ← 0, PC ← MTVEC, 冲刷 IF/ID（ID/EX 不冲，前面的指令完成）
+//   - 中断进入: 有 pending && mie && !stall && !flush && !mret_taken
+//     → mepc ← PC, mcause ← 类型, mie ← 0, PC ← MTVEC, 冲刷 IF/ID（ID/EX 不冲，前面的指令完成）
 //   - CSR 访问通过 store 到 0xD000_xxxx 段（地址被 CPU 内部捕获，不会写到 RAM）:
 //       sw 任意值到 0xD000_0000 → mie ← 1  (使能中断)
 //       sw 任意值到 0xD000_0004 → mie ← 0  (关闭中断)
 //       sw 任意值到 0xD000_0008 → MRET: PC ← mepc, mie ← 1, 冲刷 IF/ID 和 ID/EX
+//       lw 0xD000_000C         → mcause（1=按钮, 2=计时器, 3=辅助按钮）
 //
 // dm_ctrl[2:0] = funct3[2:0]，与 mem_w 共同描述访存类型：
 //   mem_w=0, dm_ctrl=010 → lw
@@ -41,7 +42,7 @@ module PCPU(
     output [31:0] Data_out,    // 写出数据（rs2），从 MEM 阶段输出
     output [2:0]  dm_ctrl,     // 访存控制 = funct3，从 MEM 阶段输出
     output        CPU_MIO,     // 正在访问 MIO（load 或 store）
-    input         INT          // 中断请求（1 拍脉冲），由 TOP 的 BTN 上升沿检测产生
+    input  [2:0]  INT          // 三路中断请求：0=BTN1, 1=timer, 2=BTNL
 );
 
     // ================================================================
@@ -70,6 +71,9 @@ module PCPU(
     localparam CSR_ENABLE   = 8'h00;         // 写 0xD000_0000 → 使能中断
     localparam CSR_DISABLE  = 8'h04;         // 写 0xD000_0004 → 关闭中断
     localparam CSR_MRET     = 8'h08;         // 写 0xD000_0008 → 中断返回
+    localparam CSR_MCAUSE   = 8'h0C;         // 读 0xD000_000C → 当前中断类型
+    localparam CSR_PENDING  = 8'h10;         // 读 0xD000_0010 → pending 位
+    localparam CSR_MEPC     = 8'h14;         // 读 0xD000_0014 → mepc
 
     // ================================================================
     //  寄存器堆（32 × 32bit，x0 恒为 0）
@@ -82,7 +86,8 @@ module PCPU(
     // ================================================================
     reg        mie;          // 全局中断使能 (machine interrupt enable)
     reg [31:0] mepc;         // 中断返回地址
-    reg        int_pending;  // 已收到但未处理的中断锁存
+    reg [31:0] mcause;       // 中断类型: 1=按钮, 2=计时器, 3=辅助按钮
+    reg [2:0]  int_pending;  // 已收到但未处理的中断锁存
 
     // --- 前向声明：ID/EX 前递和 WB->ID 同拍读写旁路共用 ---
     wire [31:0] ex_mem_wb_data;
@@ -442,10 +447,22 @@ module PCPU(
     //        sw 到 0xD000_0004 → 关闭中断 (mie=0)
     //        sw 到 0xD000_0008 → MRET (PC←mepc, mie=1, 冲刷)
     // ================================================================
-    wire ex_is_csr_write   = ID_EX_mem_w && (alu_out[31:28] == CSR_SEG);
+    wire ex_is_csr_access  = (alu_out[31:28] == CSR_SEG);
+    wire ex_is_csr_write   = ID_EX_mem_w && ex_is_csr_access;
+    wire ex_is_csr_read    = ID_EX_is_load && ex_is_csr_access;
     wire ex_is_csr_enable  = ex_is_csr_write && (alu_out[7:0] == CSR_ENABLE);
     wire ex_is_csr_disable = ex_is_csr_write && (alu_out[7:0] == CSR_DISABLE);
     wire ex_is_csr_mret    = ex_is_csr_write && (alu_out[7:0] == CSR_MRET);
+
+    reg [31:0] ex_csr_rdata;
+    always @(*) begin
+        case (alu_out[7:0])
+            CSR_MCAUSE:  ex_csr_rdata = mcause;
+            CSR_PENDING: ex_csr_rdata = {29'b0, int_pending};
+            CSR_MEPC:    ex_csr_rdata = mepc;
+            default:     ex_csr_rdata = {31'b0, mie};
+        endcase
+    end
 
     assign mret_taken = ex_is_csr_mret;
 
@@ -455,7 +472,17 @@ module PCPU(
     //  - int_pending 是 INT 输入的电平/脉冲锁存，避免单拍 INT 在 stall 时丢失
     //  - 在 stall / 分支flush / MRET 同周期内不进入中断，保持精确性
     // ================================================================
-    assign int_taken = int_pending && mie && !stall && !flush && !mret_taken;
+    wire [2:0] irq_pending_now = int_pending | INT;
+    wire [1:0] irq_cause_next =
+        irq_pending_now[0] ? 2'd1 :
+        irq_pending_now[1] ? 2'd2 :
+        irq_pending_now[2] ? 2'd3 : 2'd0;
+    wire [2:0] irq_taken_mask =
+        irq_pending_now[0] ? 3'b001 :
+        irq_pending_now[1] ? 3'b010 :
+        irq_pending_now[2] ? 3'b100 : 3'b000;
+
+    assign int_taken = (irq_pending_now != 3'b000) && mie && !stall && !flush && !mret_taken;
 
     // ================================================================
     //  CSR / 中断状态更新
@@ -464,27 +491,32 @@ module PCPU(
         if (reset) begin
             mie         <= 1'b0;
             mepc        <= 32'h0;
-            int_pending <= 1'b0;
+            mcause      <= 32'h0;
+            int_pending <= 3'b000;
         end else begin
-            // 1) INT 输入锁存
-            if (INT) int_pending <= 1'b1;
-
             // 2) 进入中断（最高优先级）
             if (int_taken) begin
                 mepc        <= PC;        // 当前 PC 是 ISR 完后要回到的位置
+                mcause      <= {30'b0, irq_cause_next};
                 mie         <= 1'b0;      // 关中断，禁止嵌套
-                int_pending <= 1'b0;      // 清掉 pending（已处理）
+                int_pending <= irq_pending_now & ~irq_taken_mask;
             end
             // 3) MRET
             else if (mret_taken) begin
                 mie <= 1'b1;
+                int_pending <= irq_pending_now;
             end
             // 4) 显式使能 / 关闭
             else if (ex_is_csr_enable) begin
                 mie <= 1'b1;
+                int_pending <= irq_pending_now;
             end
             else if (ex_is_csr_disable) begin
                 mie <= 1'b0;
+                int_pending <= irq_pending_now;
+            end
+            else begin
+                int_pending <= irq_pending_now;
             end
         end
     end
@@ -501,6 +533,8 @@ module PCPU(
     reg [2:0]  EX_MEM_funct3;
     reg        EX_MEM_mem_w;
     reg        EX_MEM_is_load, EX_MEM_is_store;
+    reg        EX_MEM_is_csr_read;
+    reg [31:0] EX_MEM_csr_rdata;
     reg        EX_MEM_is_jal, EX_MEM_is_jalr;
 
     always @(posedge clk or posedge reset) begin
@@ -514,6 +548,8 @@ module PCPU(
             EX_MEM_wb_en    <= 1'b0;
             EX_MEM_is_load  <= 1'b0;
             EX_MEM_is_store <= 1'b0;
+            EX_MEM_is_csr_read <= 1'b0;
+            EX_MEM_csr_rdata   <= 32'h0;
             EX_MEM_is_jal   <= 1'b0;
             EX_MEM_is_jalr  <= 1'b0;
         end else begin
@@ -522,13 +558,15 @@ module PCPU(
             EX_MEM_PC       <= ID_EX_PC;
             EX_MEM_rd       <= ID_EX_rd;
             EX_MEM_funct3   <= ID_EX_funct3;
-            // 注意: CSR store（写 0xD000_xxxx）不应真正出现在外部总线，
-            //       这里把它转换为 NOP（mem_w / is_store 都置 0），仅由
+            // 注意: CSR load/store（访问 0xD000_xxxx）不应真正出现在外部总线，
+            //       这里把 store 转换为 NOP（mem_w / is_store 都置 0），仅由
             //       CPU 内部的 CSR 状态机处理；EX_MEM_alu_out 等仍正常前递。
             EX_MEM_mem_w    <= ID_EX_mem_w   && !ex_is_csr_write;
             EX_MEM_wb_en    <= ID_EX_wb_en;
-            EX_MEM_is_load  <= ID_EX_is_load;
+            EX_MEM_is_load  <= ID_EX_is_load && !ex_is_csr_read;
             EX_MEM_is_store <= ID_EX_is_store && !ex_is_csr_write;
+            EX_MEM_is_csr_read <= ex_is_csr_read;
+            EX_MEM_csr_rdata   <= ex_csr_rdata;
             EX_MEM_is_jal   <= ID_EX_is_jal;
             EX_MEM_is_jalr  <= ID_EX_is_jalr;
         end
@@ -543,6 +581,7 @@ module PCPU(
     //这个信号直接连到了前递实现（278起）里的 ex_rs1_data 和 ex_rs2_data 的多路选择器里，供 EX 阶段使用
     assign ex_mem_wb_data =
         (EX_MEM_is_jal | EX_MEM_is_jalr) ? (EX_MEM_PC + 32'd4) :
+        EX_MEM_is_csr_read                ? EX_MEM_csr_rdata :
         EX_MEM_is_load                    ? Data_in :  // MEM阶段load数据已到
                                             EX_MEM_alu_out;
 
@@ -564,6 +603,8 @@ module PCPU(
     reg [31:0] MEM_WB_mem_data;
     reg [31:0] MEM_WB_PC;
     reg        MEM_WB_is_load;
+    reg        MEM_WB_is_csr_read;
+    reg [31:0] MEM_WB_csr_rdata;
     reg        MEM_WB_is_jal, MEM_WB_is_jalr;
 
     always @(posedge clk or posedge reset) begin
@@ -574,6 +615,8 @@ module PCPU(
             MEM_WB_rd       <= 5'h0;
             MEM_WB_wb_en    <= 1'b0;
             MEM_WB_is_load  <= 1'b0;
+            MEM_WB_is_csr_read <= 1'b0;
+            MEM_WB_csr_rdata   <= 32'h0;
             MEM_WB_is_jal   <= 1'b0;
             MEM_WB_is_jalr  <= 1'b0;
         end else begin
@@ -583,6 +626,8 @@ module PCPU(
             MEM_WB_rd       <= EX_MEM_rd;
             MEM_WB_wb_en    <= EX_MEM_wb_en;
             MEM_WB_is_load  <= EX_MEM_is_load;
+            MEM_WB_is_csr_read <= EX_MEM_is_csr_read;
+            MEM_WB_csr_rdata   <= EX_MEM_csr_rdata;
             MEM_WB_is_jal   <= EX_MEM_is_jal;
             MEM_WB_is_jalr  <= EX_MEM_is_jalr;
         end
@@ -593,6 +638,7 @@ module PCPU(
     //  选择写回数据，写入寄存器堆
     // ================================================================
     assign wb_data =
+        MEM_WB_is_csr_read                   ? MEM_WB_csr_rdata        :
         MEM_WB_is_load                      ? MEM_WB_mem_data        :
         (MEM_WB_is_jal | MEM_WB_is_jalr)   ? (MEM_WB_PC + 32'd4)   :
                                               MEM_WB_alu_out;

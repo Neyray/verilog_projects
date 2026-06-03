@@ -93,25 +93,44 @@ wire [31:0] none;
 // ===================== 模块实例化 =====================
 
 // =============================================================
-// 中断源链路 (v3)
-//   原 v1 直接在 Clk_CPU 域采样异步 BTN, 没消抖、没跨时钟同步,
-//   实际板上按键抖动 5~20ms, 既会漏触发也会被拆成多个伪脉冲。
+// 中断源链路 (v4) —— 标准三段式消抖 + 跨时钟翻转同步
+//   关键修复:
+//     1) v3 的 raw_rising 直接采样异步 BTN 用作组合上升沿, 会因为亚稳态
+//        把第一次按下消化掉; 同时 100ms lockout 在抖动头几个 ns 就上锁,
+//        反而把后续真正稳定的 btn_rising 屏蔽了, 整路按键就没反应。
+//     2) v4 在最前端先加 2-FF 同步器, 把异步 BTN 拉进 100MHz 时钟域;
+//        再做 5ms 稳态消抖 -> 上升沿 -> 翻转, 然后跨到 Clk_CPU 边沿脉冲。
+//        没有 lockout: 5ms 消抖窗口本身就足够吃掉机械抖动。
 //
 //   新链路 (按数据流方向):
-//     (BTN_out[0] | BTN_out[1]) / (BTN_out[2] | BTN_out[3])
-//        └─► [A] 100MHz 系统时钟域消抖 (~5ms)         →  btn1_dbnc
-//        └─► [B] 100MHz 域上升沿检测                 →  btn1_rising  (1 个 clk 拍宽)
-//        └─► [C] 每次按下翻转一次事件位 btn1_event_tog
-//        └─► [D] Clk_CPU 域 2-FF 同步器              →  event_tog_s1
-//        └─► [E] Clk_CPU 域翻转检测                  →  btn_irq_pulse
+//     (BTN_out[0] | BTN_out[1]) / (BTN_out[2] | BTN_out[3])  (异步)
+//        └─► [A] 2-FF 同步到 clk 域                    →  btn_sync_1
+//        └─► [B] 5ms 稳态消抖                          →  btn_dbnc
+//        └─► [C] clk 域上升沿检测                      →  btn_rising
+//        └─► [D] 每次按下翻转一次事件位                →  btn_event_tog
+//        └─► [E] Clk_CPU 域 2-FF 同步器                →  event_tog_s1
+//        └─► [F] Clk_CPU 域翻转检测                    →  btn_irq_pulse
 //        └─► PCPU.INT
 // =============================================================
 
-localparam BTN_DBNC_MAX    = 20'd500_000;    // 100MHz x 5ms
-localparam BTN_LOCKOUT_MAX = 24'd10_000_000; // 100MHz x 100ms, block bounce/repeat
+localparam BTN_DBNC_MAX = 20'd500_000;    // 100MHz x 5ms
 
-// [A] 消抖: 输入与稳态相等就清零计数; 否则计数累加, 累计 ~5ms 都不变才更新稳态
-wire [1:0] irq_btn_raw = {BTN_out[2] | BTN_out[3], BTN_out[0] | BTN_out[1]};  // [0]=BTN1: BTNC/BTNU, [1]=BTNL/BTNR
+// 原始异步按键合并: [0] = BTNC/BTNU (Class 1), [1] = BTNL/BTNR (Class 3)
+wire [1:0] irq_btn_raw = {BTN_out[2] | BTN_out[3], BTN_out[0] | BTN_out[1]};
+
+// [A] 2-FF 同步器: 把异步 BTN 拉进 100MHz clk 域, 消除亚稳态
+reg [1:0] btn_sync_0, btn_sync_1;
+always @(posedge clk or posedge rst_i) begin
+    if (rst_i) begin
+        btn_sync_0 <= 2'b00;
+        btn_sync_1 <= 2'b00;
+    end else begin
+        btn_sync_0 <= irq_btn_raw;
+        btn_sync_1 <= btn_sync_0;
+    end
+end
+
+// [B] 消抖: 输入与稳态相等就清零计数; 否则计数累加, 累计 ~5ms 都不变才更新稳态
 reg [19:0] dbnc_cnt [0:1];
 reg [1:0]  btn_dbnc;
 integer irq_btn_i;
@@ -123,11 +142,11 @@ always @(posedge clk or posedge rst_i) begin
         end
     end else begin
         for (irq_btn_i = 0; irq_btn_i < 2; irq_btn_i = irq_btn_i + 1) begin
-            if (irq_btn_raw[irq_btn_i] == btn_dbnc[irq_btn_i]) begin
+            if (btn_sync_1[irq_btn_i] == btn_dbnc[irq_btn_i]) begin
                 dbnc_cnt[irq_btn_i] <= 20'd0;
             end else if (dbnc_cnt[irq_btn_i] == BTN_DBNC_MAX) begin
                 dbnc_cnt[irq_btn_i] <= 20'd0;
-                btn_dbnc[irq_btn_i] <= irq_btn_raw[irq_btn_i];
+                btn_dbnc[irq_btn_i] <= btn_sync_1[irq_btn_i];
             end else begin
                 dbnc_cnt[irq_btn_i] <= dbnc_cnt[irq_btn_i] + 20'd1;
             end
@@ -135,7 +154,7 @@ always @(posedge clk or posedge rst_i) begin
     end
 end
 
-// [B] 100MHz 域上升沿检测 (源时钟域内做边沿一定不丢)
+// [C] clk 域上升沿检测
 reg [1:0] btn_dbnc_d;
 always @(posedge clk or posedge rst_i) begin
     if (rst_i) btn_dbnc_d <= 2'b00;
@@ -143,39 +162,14 @@ always @(posedge clk or posedge rst_i) begin
 end
 wire [1:0] btn_rising = btn_dbnc & ~btn_dbnc_d;   // 1 clk 拍宽
 
-// [C] 事件翻转 + 抖动锁定。
-//     原始上升沿先触发一次, 避免按键因为消抖窗口/短按被漏掉;
-//     100ms lockout 会屏蔽机械抖动, 也会屏蔽随后到来的消抖上升沿。
-reg [1:0] irq_btn_raw_d;
+// [D] 每次稳定按下翻转事件位
+reg [1:0] btn_event_tog;
 always @(posedge clk or posedge rst_i) begin
-    if (rst_i) irq_btn_raw_d <= 2'b00;
-    else       irq_btn_raw_d <= irq_btn_raw;
-end
-wire [1:0] raw_rising = irq_btn_raw & ~irq_btn_raw_d;
-wire [1:0] btn_press_event = btn_rising | raw_rising;
-
-reg [1:0]  btn_event_tog;
-reg [23:0] irq_lock_cnt [0:1];
-integer irq_evt_i;
-always @(posedge clk or posedge rst_i) begin
-    if (rst_i) begin
-        btn_event_tog <= 2'b00;
-        for (irq_evt_i = 0; irq_evt_i < 2; irq_evt_i = irq_evt_i + 1) begin
-            irq_lock_cnt[irq_evt_i] <= 24'd0;
-        end
-    end else begin
-        for (irq_evt_i = 0; irq_evt_i < 2; irq_evt_i = irq_evt_i + 1) begin
-            if (btn_press_event[irq_evt_i] && (irq_lock_cnt[irq_evt_i] == 24'd0)) begin
-                btn_event_tog[irq_evt_i] <= ~btn_event_tog[irq_evt_i];
-                irq_lock_cnt[irq_evt_i] <= BTN_LOCKOUT_MAX;
-            end else if (irq_lock_cnt[irq_evt_i] != 24'd0) begin
-                irq_lock_cnt[irq_evt_i] <= irq_lock_cnt[irq_evt_i] - 24'd1;
-            end
-        end
-    end
+    if (rst_i) btn_event_tog <= 2'b00;
+    else       btn_event_tog <= btn_event_tog ^ btn_rising;
 end
 
-// [D] 跨时钟到 Clk_CPU 域: 标准 2-FF 同步器
+// [E] 跨时钟到 Clk_CPU 域: 标准 2-FF 同步器
 reg [1:0] event_tog_s0, event_tog_s1;
 always @(posedge Clk_CPU or posedge rst_i) begin
     if (rst_i) begin
@@ -187,7 +181,7 @@ always @(posedge Clk_CPU or posedge rst_i) begin
     end
 end
 
-// [E] Clk_CPU 域翻转检测, 输出 1 个 Clk_CPU 拍的 INT 脉冲
+// [F] Clk_CPU 域翻转检测, 输出 1 个 Clk_CPU 拍的 INT 脉冲
 reg [1:0] event_tog_d;
 always @(posedge Clk_CPU or posedge rst_i) begin
     if (rst_i) event_tog_d <= 2'b00;
@@ -195,7 +189,7 @@ always @(posedge Clk_CPU or posedge rst_i) begin
 end
 wire [1:0] btn_irq_pulse = event_tog_s1 ^ event_tog_d;   // 每次稳定按下产生 1 拍
 
-// [F] 周期 timer 中断：快档约每 1 秒触发一次
+// [G] 周期 timer 中断：快档约每 1 秒触发一次
 localparam TIMER_RELOAD = 24'd6_250_000;
 reg [23:0] timer_cnt;
 reg        timer_irq_pulse;

@@ -154,7 +154,7 @@ isr_wrong:
 
 ### 一拍一拍走一次中断进入 + 返回
 
-把 `mepc=0xP0`、ISR=0x80~0xCC、主循环 PC=P0 这次中断展开看：
+把 `mepc=0xP0`、ISR 从 `0x80` 开始、主循环 PC=P0 这次中断展开看：
 
 ```
 拍号 │  IF      │  ID         │  EX         │  MEM      │  WB       │  事件
@@ -163,10 +163,10 @@ isr_wrong:
  N+1 │ 0x80(MT) │ NOP(flush)  │ <prev>      │ ...       │ ...       │ ★ mepc<=P0, PC<=0x80
  N+2 │ 0x84     │ 0x80        │ NOP         │ <prev>    │ ...       │
  ... │ (ISR 体)                                                       │
- M   │ 0xD0+    │ 0xCC sw     │ 0xC8        │ ...       │ ...       │
- M+1 │ 0xD4     │ 0xD0        │ 0xCC sw★    │ 0xC8      │ ...       │ ★ mret_taken
- M+2 │ P0       │ NOP(flush)  │ NOP(flush)  │ 0xCC sw   │ 0xC8      │ ★ PC<=mepc=P0
- M+3 │ P0+4     │ P0          │ NOP         │ NOP       │ 0xCC sw   │ 主循环正常推进
+ M   │ after+4  │ MRET sw     │ before      │ ...       │ ...       │
+ M+1 │ after+8  │ after+4     │ MRET sw★    │ before    │ ...       │ ★ mret_taken
+ M+2 │ P0       │ NOP(flush)  │ NOP(flush)  │ MRET sw   │ before    │ ★ PC<=mepc=P0
+ M+3 │ P0+4     │ P0          │ NOP         │ NOP       │ MRET sw   │ 主循环正常推进
 ```
 
 - **进入中断只丢 IF 阶段那 1 条指令** —— ID/EX 等已发射的指令照常完成（精确异常）。
@@ -264,36 +264,14 @@ CPU 内部在 EX 阶段判 `mem_w && Addr[31:28]==0xD`，然后：
 **PCPU_TOP.v：** 只改 INT 这一根线。从 BTN_out[1] 到 PCPU.INT 的五段链路：
 
 ```verilog
-// PCPU_TOP.v 第 112~170 行
-// [A] 100MHz 域消抖 (~21ms 必须稳定才接受新电平)
-reg [20:0] dbnc_cnt;  reg btn1_dbnc;
-always @(posedge clk or posedge rst_i)
-    if (rst_i)                              {dbnc_cnt, btn1_dbnc} <= 0;
-    else if (BTN_out[1] == btn1_dbnc)       dbnc_cnt <= 0;
-    else if (&dbnc_cnt)                     btn1_dbnc <= BTN_out[1];
-    else                                    dbnc_cnt <= dbnc_cnt + 1;
+// PCPU_TOP.v 第 111~170 行
+// [A] 100MHz 域消抖 (~5ms 必须稳定才接受新电平)
+// [B] 100MHz 域上升沿检测，得到 btn1_rising
+// [C] 每次 btn1_rising 翻转一次 btn1_event_tog
+// [D] btn1_event_tog 用 2-FF 同步到 Clk_CPU 域
+// [E] Clk_CPU 域检测 toggle 变化，生成 1 拍 int_pulse
 
-// [B] 100MHz 域上升沿（同源时钟内做边沿一定不丢）
-reg btn1_dbnc_d;
-always @(posedge clk) btn1_dbnc_d <= btn1_dbnc;
-wire btn1_rising = btn1_dbnc & ~btn1_dbnc_d;
-
-// [C] 拉宽到 ~500ms（慢档 Clk_CPU 周期 333ms，保证至少 1 次 posedge 命中）
-reg [25:0] req_cnt;  reg int_req;
-always @(posedge clk)
-    if (btn1_rising)                            {int_req, req_cnt} <= {1'b1, 26'd0};
-    else if (int_req && req_cnt == 50_000_000)  int_req <= 0;
-    else if (int_req)                           req_cnt <= req_cnt + 1;
-
-// [D] 跨时钟 2-FF 同步器
-reg int_req_s0, int_req_s1;
-always @(posedge Clk_CPU) {int_req_s1, int_req_s0} <= {int_req_s0, int_req};
-
-// [E] Clk_CPU 域上升沿 → 单拍 INT 给 CPU
-reg int_req_d;
-always @(posedge Clk_CPU) int_req_d <= int_req_s1;
-wire int_pulse = int_req_s1 & ~int_req_d;
-
+wire int_pulse = event_tog_s1 ^ event_tog_d;
 PCPU U1( ... .INT(int_pulse) );
 ```
 
@@ -301,10 +279,10 @@ PCPU U1( ... .INT(int_pulse) );
 
 | 问题 | 旧实现（v1） | v2 修复 |
 |------|--------------|---------|
-| 按键抖动 5~20ms → 多次伪边沿 | 没消抖 | [A] 21ms 稳定才接受 |
-| 异步信号在目标域直接采样 → 元稳态 | 单 FF 采样 | [B][C][D] 同源采样 → 拉宽 → 双 FF 同步 |
-| 慢档 Clk_CPU 周期 333ms > 按键持续时间 → 漏触发 | 直接采按键电平 | [C] 拉宽到 500ms 再过桥 |
-| 按住按键不放 → 持续触发 | 边沿可控但毛刺漏 | 在干净的 `int_req` 上做边沿 |
+| 按键抖动 5~20ms → 多次伪边沿 | 没消抖 | [A] 约 5ms 稳定才接受，响应更快 |
+| 异步信号在目标域直接采样 → 元稳态 | 单 FF 采样 | [C][D] 事件 toggle + 双 FF 同步 |
+| 拉宽电平期间第二次按键被吞掉 | level 维持 500ms | 每次稳定按下都翻转一次事件位 |
+| 按住按键不放 → 持续触发 | 直接采电平 | 只对干净上升沿触发一次 |
 
 **XDC 时钟约束的关键修复：** 旧版 [`icf.xdc`](icf.xdc) 写 `-period 100.00`（=10MHz，不对！板子是 100MHz）。Vivado 按 10MHz 跑时序分析允许极长组合路径，实际 100MHz 时某些路径压在 setup/hold 边界 → 快档下偶尔无反应。改成 `-period 10.00 -waveform {0 5}` 后才真正按 100MHz 约束布线。
 
@@ -320,12 +298,12 @@ PCPU U1( ... .INT(int_pulse) );
 
 | 状态 | 7-seg 数码管 (`SW7..5=000`) | 16 LED 灯条 |
 |------|------------------------------|-------------|
-| 正常游戏 | `A000ppss`：`pp`=罚分次数，`ss`=当前进度 0..3 | `LED[7:0]` 是移动光标，`LED[15:8]` 是当前目标位 |
+| 正常游戏 | `A000ppss`：`pp`=罚分次数，`ss`=当前进度 0..3 | `LED[7:0]` 是移动光标，`LED[12:8]` 是当前目标位，`LED15` 亮时按键 |
 | 按对一次 | 短暂显示 `C0DE000s`，进度 `s` 增加 | 继续显示下一关目标和移动光标 |
 | 按错一次 | 短暂显示 `BAD000pp`，罚分 `pp` 增加 | 进度清零，目标回到第一关 |
 | 完成 4 步 | 短暂显示 `600D00ww`，胜利次数 `ww` 增加 | 进度清零，重新开始下一轮 |
 
-目标顺序固定为：`0x02 → 0x08 → 0x01 → 0x10`。玩家需要在低 8 位光标等于当前高 8 位目标时按 `BTNU`。没按到目标会触发惩罚：罚分 +1，进度回 0。
+目标顺序固定为：`0x02 → 0x08 → 0x01 → 0x10`。玩家可以看 `LED15`：它亮起时按 `BTNU` 最稳。ISR 还接受“当前帧或上一帧”命中，避免因为消抖/中断延迟导致刚按到就被判 BAD。
 
 ### 程序结构与寄存器分工
 
@@ -335,15 +313,15 @@ PCPU U1( ... .INT(int_pulse) );
 
 0x80: ISR（必须放这里——MTVEC 硬编码）
       根据稳定的 stage 重新计算目标值
-      if cursor == target:
+      if cursor == target or previous_cursor == target:
           stage++；满 4 步则 win++ 且 stage=0
       else:
           penalty++；stage=0
       设置短暂状态提示标记 (x23/x24)
       sw x0, 8(x12)   ; ★ MRET
 
-0x100: main_loop
-       计算当前目标，LED[15:8]=目标 / LED[7:0]=光标，sw 到 0xF000_0000
+0x120: main_loop
+       计算当前目标，LED[12:8]=目标 / LED[7:0]=光标，LED15=READY，sw 到 0xF000_0000
        数码管显示 A000ppss / C0DE000s / BAD000pp / 600D00ww
        软件延时后左移光标（5 位循环 1→2→4→8→16→1），jal 回 main_loop
 ```
@@ -372,11 +350,11 @@ PCPU U1( ... .INT(int_pulse) );
 | `0x04` | `D0000637` | `lui x12, 0xD0000` | CSR 基址 |
 | `0x08` | `F00007B7` | `lui x15, 0xF0000` | LED 基址 |
 | `0x24` | `00062023` | `sw x0, 0(x12)` | 开中断（mie ← 1） |
-| `0x28` | `0D80006F` | `jal x0, 0x100` | 跳到主循环 |
+| `0x28` | `0F80006F` | `jal x0, 0x120` | 跳到主循环 |
 | `0x80` | `00200E13` | `addi x28, x0, 2` | ISR 入口（MTVEC），默认第一关目标 |
-| `0xAC` | `03C51863` | `bne x10, x28, isr_wrong` | 判断按键是否命中目标 |
-| `0xCC / 0xD8 / 0xEC` | `00062423` | `sw x0, 8(x12)` | 三条路径都快速 MRET |
-| `0x100` | `00200913` | `addi x18, x0, 2` | 主循环入口 |
+| `0xAC` | `01C50E63` | `beq x10, x28, isr_correct` | 当前光标命中则正确 |
+| `0xE4 / 0xF0 / 0x104` | `00062423` | `sw x0, 8(x12)` | 三条路径都快速 MRET |
+| `0x120` | `00200913` | `addi x18, x0, 2` | 主循环入口 |
 
 完整可汇编源见 [`custom_int.s`](custom_int.s)。`custom_int.coe` 共 1024 word，未使用的位置填 `0x00000013`（`addi x0, x0, 0`，即 NOP）。
 
@@ -391,11 +369,11 @@ PCPU U1( ... .INT(int_pulse) );
 
 | 步骤 | SW 设定 | 操作 | 期望现象 | 验什么（对应代码） |
 |------|---------|------|----------|---------------------|
-| 1 | `SW0=0`，`SW7..5=000`，`SW2=0`（快档） | 复位 | 数码管显示 `A0000000`；LED 高 8 位 `0x0200`，低 8 位光标在 `01/02/04/08/10` 循环移动 | 主循环 + 小程序状态机 + LED/数码管 IO 正常 ([`custom_int.s:76`](custom_int.s)+) |
-| 2 | 同上 | 光标到 `0x02` 时按 `BTNU` | 数码管短暂显示 `C0DE0001`，几帧后变 `A0000001` | **进中断 → ISR 比较命中 → MRET 返回**；x13 stage 被 ISR 推到 1 ([`custom_int.s:50-66`](custom_int.s)) |
+| 1 | `SW7..5=000`，`SW2=0`（快档） | 复位 | 数码管显示 `A0000000`；LED9 为第一关目标，低位光标循环，光标到目标时 LED15 会亮 | 主循环 + 小程序状态机 + LED/数码管 IO 正常 |
+| 2 | 同上 | `LED15` 亮时按 `BTNU` | 数码管短暂显示 `C0DE0001`，几帧后变 `A0000001` | **进中断 → ISR 比较命中 → MRET 返回**；x13 stage 被 ISR 推到 1 |
 | 3 | 同上 | 依次在 `0x08`、`0x01`、`0x10` 命中按键 | 第 4 次命中后显示 `600D0001`，然后回到 `A0000000` | 完整序列通过，win 计数 +1（ISR WIN 路径 [`custom_int.s:53-61`](custom_int.s)） |
 | 4 | 同上 | 故意在非目标位置按 `BTNU` | 显示 `BAD00001`，几帧后变 `A0000100` | 错误输入触发惩罚，penalty +1 且 stage 清零（ISR BAD 路径 [`custom_int.s:68-73`](custom_int.s)） |
-| 5 | `SW2=1`（慢档），`SW7..5=111`（看 PC 字节地址） | 按 `BTNU` | PC 从主循环段（≥ 0x100）跳到 `0x80`，走十几条后**回到原 PC 附近 +4** | **中断进入与返回路径正确**——验证"返回原状态"：PC 没有跳到一个随机位置 ([`PCPU.v:116, 474`](PCPU.v)) |
+| 5 | `SW2=1`（慢档），`SW7..5=111`（看 PC 字节地址） | 按 `BTNU` | PC 从主循环段（≥ 0x120）跳到 `0x80`，走十几条后**回到原 PC 附近 +4** | **中断进入与返回路径正确**——验证"返回原状态"：PC 没有跳到一个随机位置 ([`PCPU.v:116, 474`](PCPU.v)) |
 | 6 | `SW2=1`，`SW7..5=010`（看当前指令机器码） | 慢速观察一次中断 | ISR 第一条是 `00200E13`，最后三条 MRET 都是 `00062423` | ROM 内容与 [`custom_int.s`](custom_int.s) 对应 |
 | 7 | `SW2=1`，`SW7..5=001`（看 PC>>2） | 持续按 BTNU 多次 | 主循环画面不会"卡住"或长时间停在 ISR 区 | **ISR 没有软件延时，中断返回延迟非常短**（约 18~22 拍） |
 
@@ -407,8 +385,8 @@ PCPU U1( ... .INT(int_pulse) );
 |------|------|
 | 按 BTNU 完全没反应 | ① ROMD IP 是否重新加载了 `custom_int.coe`；② `PCPU.INT` 是否接 `int_pulse`；③ `icf.xdc` 周期是否已改为 10ns |
 | 按键后长时间停在 ISR 显示 | 检查 ROM 中 `0xCC/0xD8/0xEC` 是否都为 `00062423`；新版 ISR 没有软件延时，提示由主循环刷新 |
-| 经常按错 | 这是游戏逻辑在工作。低 8 位光标必须与高 8 位目标同列时按下；错误会罚分并重置进度 |
-| 慢档下连续快按少记一次 | 顶层把一次按键请求拉宽约 500ms 以保证慢 CPU 时钟能采到；慢档连续按键建议间隔 > 0.6s |
+| 经常按错 | 优先看 `LED15`，它亮时按；新版 ISR 接受当前帧和上一帧命中，仍 BAD 时多半是 ROMD 没重新加载新版 `custom_int.coe` |
+| 慢档下连续快按少记一次 | 新版已去掉 500ms level 拉宽，改成事件 toggle；慢档观察 PC 时仍建议一次只按一下，等 PC 跳回主循环后再按 |
 | 中断返回到错误的 PC | 检查 [`PCPU.v:474`](PCPU.v) `mepc <= PC` 是否用 `PC` 而不是 `PC+4`、[`PCPU.v:116`](PCPU.v) `PC <= mepc` 是否在 `mret_taken` 分支 |
 
 ---
@@ -425,9 +403,9 @@ PCPU U1( ... .INT(int_pulse) );
 | **INT 源** | — | — | **BTN_out[1] 上升沿，1 拍脉冲** |
 | 默认指令 ROM | `testac.coe` | `testac.coe` | **`custom_int.coe`（序列锁 main + 快速 ISR）** |
 | 数码管 `data0` | 进度码 | 进度码 | `A000ppss` 正常态 / `C0DE`、`BAD`、`600D` 状态提示 |
-| LED 16 位 | testac 进度 | testac 进度 | **高 8 位目标 + 低 8 位移动光标** |
+| LED 16 位 | testac 进度 | testac 进度 | **LED[12:8] 目标 + LED[7:0] 光标 + LED15 READY** |
 | 验收方式 | 看 "AC123456" | 看 "AC123456" | **按 BTNU 完成 `0x02→0x08→0x01→0x10`，错按罚分** |
-| 顶层新增逻辑 | — | RAM 写保护门控 | + **完整中断 IO 链路**：消抖 (~21ms) + 100MHz 同源边沿 + 500ms 拉宽 + 2-FF 跨时钟同步 + Clk_CPU 域边沿 |
+| 顶层新增逻辑 | — | RAM 写保护门控 | + **完整中断 IO 链路**：消抖 (~5ms) + 100MHz 同源边沿 + 事件 toggle + 2-FF 跨时钟同步 + Clk_CPU 域翻转检测 |
 | 时钟约束 (xdc) | `-period 100.00` (10MHz, **错的**) | 同 P1 | **`-period 10.00`** (100MHz, 修正) |
 | 流水线损失 | — | 分支 2 拍、load-use 1 拍 | + 进入中断 1 拍、MRET 2 拍 |
 

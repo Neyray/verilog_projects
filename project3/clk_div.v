@@ -9,10 +9,12 @@ module clk_div(input clk,
 					
 // Clock divider
 
+	localparam FAST_CPU_CLKDIV_BIT = 3;   // 约 6.25MHz，LED/提示显示肉眼可跟
+	localparam SLOW_CPU_CLKDIV_BIT = 24;  // 约 3Hz，便于验收时观察 PC/指令
 
 	always @ (posedge clk or posedge rst) begin 
 		if (rst) clkdiv <= 0; else clkdiv <= clkdiv + 1'b1; end
 		
-	assign Clk_CPU=(SW2)? clkdiv[24] : clkdiv[0];
+	assign Clk_CPU=(SW2)? clkdiv[SLOW_CPU_CLKDIV_BIT] : clkdiv[FAST_CPU_CLKDIV_BIT];
 		
 endmodule

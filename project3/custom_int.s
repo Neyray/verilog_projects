@@ -7,8 +7,9 @@
 # BTNU/BTN1 是本程序唯一的实时输入：每次稳定按下都会进入一次 ISR。
 # 主循环显示一个“序列锁”小游戏：
 #   LED[7:0]  : 移动光标，按 1、2、4、8、16 循环
-#   LED[15:8] : 当前目标位
-# 当低 8 位光标与高 8 位目标重合时按下 BTNU。目标顺序固定为：
+#   LED[12:8] : 当前目标位（高 8 位镜像）
+#   LED[15]   : READY 提示灯，亮起时按 BTNU 最稳
+# 当低 8 位光标与高 8 位目标重合、或 LED15 亮起时按下 BTNU。目标顺序固定为：
 #   0x02 -> 0x08 -> 0x01 -> 0x10
 # 按对会推进当前进度；按错会增加罚分并把进度重置为 0。
 # 连续完成四步后，胜利计数器加 1。
@@ -16,6 +17,7 @@
 # ISR 内没有软件延时，只更新游戏状态并写 MRET。
 # 因此中断处理结束后能很快回到被打断的主循环状态。
 
+# 初始化代码
 _start:
     lui   x11, 0xe0000          # 7-seg base = 0xE000_0000
     lui   x12, 0xd0000          # CSR base   = 0xD000_0000
@@ -31,6 +33,7 @@ _start:
 
     .org 0x80
 isr:
+    # 中断服务程序
     # Recompute expected mask from stable stage x13. Do not depend on the
     # main loop's temporary target register, because INT may arrive mid-update.
     addi  x28, x0, 2            # stage 0 target = 0x02
@@ -48,7 +51,17 @@ isr_target_2:
     addi  x28, x0, 1            # stage 2 target = 0x01
 
 isr_compare:
-    bne   x10, x28, isr_wrong
+    # Accept the current cursor, and also the previous cursor as a small
+    # human-friendly tolerance window for debounce/interrupt latency.
+    beq   x10, x28, isr_correct
+    addi  x29, x0, 1
+    beq   x10, x29, isr_prev_is_16
+    srli  x29, x10, 1
+    jal   x0, isr_prev_done
+isr_prev_is_16:
+    addi  x29, x0, 16
+isr_prev_done:
+    bne   x29, x28, isr_wrong
 
 isr_correct:
     addi  x13, x13, 1
@@ -72,7 +85,7 @@ isr_wrong:
     addi  x24, x0, 2            # BAD flash
     sw    x0, 8(x12)            # MRET
 
-    .org 0x100
+    .org 0x120
 main_loop:
     # target mask x18 = sequence[stage]
     addi  x18, x0, 2
@@ -92,6 +105,10 @@ target_2:
 target_done:
     slli  x25, x18, 8           # high byte = target
     or    x25, x25, x10         # low byte  = cursor
+    bne   x10, x18, store_led
+    lui   x30, 0x8              # LED15 = READY: press BTNU now
+    or    x25, x25, x30
+store_led:
     sw    x25, 0(x15)
 
     beq   x23, x0, show_normal
@@ -125,7 +142,7 @@ store_display:
 
 delay_start:
     addi  x8, x0, 0
-    lui   x9, 0x60              # visible frame delay (~0.25s at fast CPU)
+    lui   x9, 0x100             # slower visible frame delay for reliable pressing
 delay_loop:
     addi  x8, x8, 1
     bne   x8, x9, delay_loop

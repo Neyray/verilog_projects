@@ -3,7 +3,7 @@
 // Module Name: PCPU_TOP  (Project 3 — 流水线 + 中断 + 自定义小程序)
 // Description: 在 Project 2 顶层基础上新增中断源：
 //   1. 指令ROM 加载 custom_int.coe（自定义中断演示程序，主循环 + ISR）
-//   2. BTN_out[1] 按键作为中断请求源；用 Clk_CPU 域同步 + 上升沿检测，
+//   2. BTN_out[1] 按键作为中断请求源；用 100MHz 域消抖 + 事件翻转跨时钟，
 //      每次按下产生 1 拍宽的 INT 脉冲，由 PCPU 内部的 int_pending 锁存
 //   3. PCPU.INT 端口由原来的 1'b0 改为 int_pulse
 //   4. 其余外设、总线、显示通道与 Project 2 完全相同
@@ -100,26 +100,30 @@ wire [31:0] none;
 //
 //   新链路 (按数据流方向):
 //     BTN_out[1]
-//        └─► [A] 100MHz 系统时钟域消抖 (~20ms)        →  btn1_dbnc
+//        └─► [A] 100MHz 系统时钟域消抖 (~5ms)         →  btn1_dbnc
 //        └─► [B] 100MHz 域上升沿检测                 →  btn1_rising  (1 个 clk 拍宽)
-//        └─► [C] 拉宽成 ~500ms 的 level int_req      →  保证慢档 Clk_CPU 也能采到
-//        └─► [D] Clk_CPU 域 2-FF 同步器              →  int_req_s1
-//        └─► [E] Clk_CPU 域上升沿检测                →  int_pulse (1 Clk_CPU 拍宽)
+//        └─► [C] 每次按下翻转一次事件位 btn1_event_tog
+//        └─► [D] Clk_CPU 域 2-FF 同步器              →  event_tog_s1
+//        └─► [E] Clk_CPU 域翻转检测                  →  int_pulse (1 Clk_CPU 拍宽)
 //        └─► PCPU.INT
 // =============================================================
 
-// [A] 消抖: 输入与稳态相等就清零计数; 否则计数累加, 累计 ~21ms 都不变才更新稳态
-reg [20:0] dbnc_cnt;
+localparam BTN_DBNC_MAX = 20'd500_000;  // 100MHz x 5ms
+
+// [A] 消抖: 输入与稳态相等就清零计数; 否则计数累加, 累计 ~5ms 都不变才更新稳态
+reg [19:0] dbnc_cnt;
 reg        btn1_dbnc;
 always @(posedge clk or posedge rst_i) begin
     if (rst_i) begin
-        dbnc_cnt  <= 21'd0;
+        dbnc_cnt  <= 20'd0;
         btn1_dbnc <= 1'b0;
     end else if (BTN_out[1] == btn1_dbnc) begin
-        dbnc_cnt <= 21'd0;
+        dbnc_cnt <= 20'd0;
+    end else if (dbnc_cnt == BTN_DBNC_MAX) begin
+        dbnc_cnt  <= 20'd0;
+        btn1_dbnc <= BTN_out[1];
     end else begin
-        dbnc_cnt <= dbnc_cnt + 21'd1;
-        if (&dbnc_cnt) btn1_dbnc <= BTN_out[1];
+        dbnc_cnt <= dbnc_cnt + 20'd1;
     end
 end
 
@@ -131,43 +135,32 @@ always @(posedge clk or posedge rst_i) begin
 end
 wire btn1_rising = btn1_dbnc & ~btn1_dbnc_d;   // 1 clk 拍宽
 
-// [C] 拉宽成 ~500ms level (慢档 Clk_CPU 周期 ≈333ms 也保证至少有 1 次 posedge 命中)
-reg [25:0] req_cnt;
-reg        int_req;
+// [C] 事件翻转: 避免 500ms level 期间的第二次按键被合并掉
+reg btn1_event_tog;
 always @(posedge clk or posedge rst_i) begin
-    if (rst_i) begin
-        req_cnt <= 26'd0;
-        int_req <= 1'b0;
-    end else if (btn1_rising) begin
-        int_req <= 1'b1;
-        req_cnt <= 26'd0;
-    end else if (int_req) begin
-        if (req_cnt == 26'd50_000_000)         // 100MHz × 0.5s
-            int_req <= 1'b0;
-        else
-            req_cnt <= req_cnt + 26'd1;
-    end
+    if (rst_i)       btn1_event_tog <= 1'b0;
+    else if (btn1_rising) btn1_event_tog <= ~btn1_event_tog;
 end
 
 // [D] 跨时钟到 Clk_CPU 域: 标准 2-FF 同步器
-reg int_req_s0, int_req_s1;
+reg event_tog_s0, event_tog_s1;
 always @(posedge Clk_CPU or posedge rst_i) begin
     if (rst_i) begin
-        int_req_s0 <= 1'b0;
-        int_req_s1 <= 1'b0;
+        event_tog_s0 <= 1'b0;
+        event_tog_s1 <= 1'b0;
     end else begin
-        int_req_s0 <= int_req;
-        int_req_s1 <= int_req_s0;
+        event_tog_s0 <= btn1_event_tog;
+        event_tog_s1 <= event_tog_s0;
     end
 end
 
-// [E] Clk_CPU 域上升沿检测, 输出 1 个 Clk_CPU 拍的 INT 脉冲
-reg int_req_d;
+// [E] Clk_CPU 域翻转检测, 输出 1 个 Clk_CPU 拍的 INT 脉冲
+reg event_tog_d;
 always @(posedge Clk_CPU or posedge rst_i) begin
-    if (rst_i) int_req_d <= 1'b0;
-    else       int_req_d <= int_req_s1;
+    if (rst_i) event_tog_d <= 1'b0;
+    else       event_tog_d <= event_tog_s1;
 end
-wire int_pulse = int_req_s1 & ~int_req_d;   // 仅按下瞬间为 1
+wire int_pulse = event_tog_s1 ^ event_tog_d;   // 每次稳定按下产生 1 拍
 
 // ---------- U1: PCPU（流水线 + 中断版） ----------
 PCPU U1(
@@ -267,7 +260,7 @@ Multi_8CH32 U5(
 SSeg7 U6(
     .clk(clk),
     .rst(rst_i),
-    .SW0(SW_out[0]),
+    .SW0(1'b0),                 // Project 3 固定纯 hex，避免调试 PC 时被 AC 模式干扰
     .flash(clkdiv[12]),
     .Hexs(Disp_num),
     .LES(LE_out),

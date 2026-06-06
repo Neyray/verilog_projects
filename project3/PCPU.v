@@ -13,7 +13,7 @@
 //   - 内部 CSR 寄存器: mie (全局中断使能), mepc (返回地址), mcause (中断类型), int_pending (锁存)
 //   - 中断入口 MTVEC = 32'h0000_0080（ISR 必须放在 0x80）
 //   - 中断进入: 有 pending && mie && !stall && !flush && !mret_taken
-//     → mepc ← PC, mcause ← 类型, mie ← 0, PC ← MTVEC, 冲刷 IF/ID（ID/EX 不冲，前面的指令完成）
+//     → mepc ← PC, mcause ← 类型, mie ← 0, PC ← MTVEC, 冲刷 IF/ID 和 ID/EX
 //   - CSR 访问通过 store 到 0xD000_xxxx 段（地址被 CPU 内部捕获，不会写到 RAM）:
 //       sw 任意值到 0xD000_0000 → mie ← 1  (使能中断)
 //       sw 任意值到 0xD000_0004 → mie ← 0  (关闭中断)
@@ -88,6 +88,7 @@ module PCPU(
     reg [31:0] mepc;         // 中断返回地址
     reg [31:0] mcause;       // 中断类型: 1=按钮, 2=计时器, 3=辅助按钮
     reg [2:0]  int_pending;  // 已收到但未处理的中断锁存
+    reg [2:0]  int_d;        // INT 边沿采样，避免长按/展宽请求重复入队
 
     // --- 前向声明：ID/EX 前递和 WB->ID 同拍读写旁路共用 ---
     wire [31:0] ex_mem_wb_data;
@@ -253,10 +254,10 @@ module PCPU(
             ID_EX_is_auipc  <= 1'b0;
             ID_EX_is_alui   <= 1'b0;
             ID_EX_is_alur   <= 1'b0;
-        end else if (flush || stall || mret_taken) begin
-            // 2. 同步冲刷 / load-use 停顿 / MRET 返回 → 插入气泡 (NOP)
-            //    注意: 中断进入(int_taken) 不冲 ID/EX —— ID 段的指令在
-            //    mepc 之前，应当正常完成；只丢弃 IF 阶段刚取到的那条。
+        end else if (flush || stall || mret_taken || int_taken) begin
+            // 2. 同步冲刷 / load-use 停顿 / MRET 返回 / 中断进入 → 插入气泡 (NOP)
+            //    中断进入时必须阻止 IF/ID 里的普通跳转流入 EX，
+            //    否则下一拍的 jal/branch flush 会覆盖 MTVEC，导致 ISR 被跳过。
             ID_EX_PC        <= 32'h0;
             ID_EX_rs1_data  <= 32'h0;
             ID_EX_rs2_data  <= 32'h0;
@@ -469,10 +470,12 @@ module PCPU(
     // ================================================================
     //  中断进入条件
     //
-    //  - int_pending 是 INT 输入的电平/脉冲锁存，避免单拍 INT 在 stall 时丢失
+    //  - int_event 是 INT 上升沿事件，避免长按或展宽请求重复入队
+    //  - int_pending 锁存事件，避免单拍 INT 在 stall / mie=0 时丢失
     //  - 在 stall / 分支flush / MRET 同周期内不进入中断，保持精确性
     // ================================================================
-    wire [2:0] irq_pending_now = int_pending | INT;
+    wire [2:0] int_event = INT & ~int_d;
+    wire [2:0] irq_pending_now = int_pending | int_event;
     wire [1:0] irq_cause_next =
         irq_pending_now[0] ? 2'd1 :
         irq_pending_now[1] ? 2'd2 :
@@ -493,20 +496,23 @@ module PCPU(
             mepc        <= 32'h0;
             mcause      <= 32'h0;
             int_pending <= 3'b000;
+            int_d       <= 3'b000;
         end else begin
-            // 2) 进入中断（最高优先级）
+            int_d <= INT;
+
+            // 1) 进入中断（最高优先级）
             if (int_taken) begin
                 mepc        <= PC;        // 当前 PC 是 ISR 完后要回到的位置
                 mcause      <= {30'b0, irq_cause_next};
                 mie         <= 1'b0;      // 关中断，禁止嵌套
                 int_pending <= irq_pending_now & ~irq_taken_mask;
             end
-            // 3) MRET
+            // 2) MRET
             else if (mret_taken) begin
                 mie <= 1'b1;
                 int_pending <= irq_pending_now;
             end
-            // 4) 显式使能 / 关闭
+            // 3) 显式使能 / 关闭
             else if (ex_is_csr_enable) begin
                 mie <= 1'b1;
                 int_pending <= irq_pending_now;

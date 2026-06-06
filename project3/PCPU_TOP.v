@@ -181,13 +181,38 @@ always @(posedge Clk_CPU or posedge rst_i) begin
     end
 end
 
-// [F] Clk_CPU 域翻转检测, 输出 1 个 Clk_CPU 拍的 INT 脉冲
+// [F] Clk_CPU 域翻转检测。边沿事件先展宽几拍再送入 CPU；
+//     PCPU 内部按上升沿入队，所以展宽不会造成一次按键重复中断。
 reg [1:0] event_tog_d;
+wire [1:0] btn_irq_edge;
 always @(posedge Clk_CPU or posedge rst_i) begin
     if (rst_i) event_tog_d <= 2'b00;
     else       event_tog_d <= event_tog_s1;
 end
-wire [1:0] btn_irq_pulse = event_tog_s1 ^ event_tog_d;   // 每次稳定按下产生 1 拍
+assign btn_irq_edge = event_tog_s1 ^ event_tog_d;
+
+localparam [2:0] BTN_IRQ_HOLD = 3'd4;
+reg [2:0] btn_irq_hold0;
+reg [2:0] btn_irq_hold1;
+
+always @(posedge Clk_CPU or posedge rst_i) begin
+    if (rst_i) begin
+        btn_irq_hold0 <= 3'd0;
+        btn_irq_hold1 <= 3'd0;
+    end else begin
+        if (btn_irq_edge[0])
+            btn_irq_hold0 <= BTN_IRQ_HOLD;
+        else if (btn_irq_hold0 != 3'd0)
+            btn_irq_hold0 <= btn_irq_hold0 - 3'd1;
+
+        if (btn_irq_edge[1])
+            btn_irq_hold1 <= BTN_IRQ_HOLD;
+        else if (btn_irq_hold1 != 3'd0)
+            btn_irq_hold1 <= btn_irq_hold1 - 3'd1;
+    end
+end
+
+wire [1:0] btn_irq_req = {|btn_irq_hold1, |btn_irq_hold0};
 
 // [G] 周期 timer 中断：快档约每 1 秒触发一次
 localparam TIMER_RELOAD = 24'd6_250_000;
@@ -206,7 +231,7 @@ always @(posedge Clk_CPU or posedge rst_i) begin
     end
 end
 
-wire [2:0] int_sources = {btn_irq_pulse[1], timer_irq_pulse, btn_irq_pulse[0]};
+wire [2:0] int_sources = {btn_irq_req[1], timer_irq_pulse, btn_irq_req[0]};
 
 // ---------- U1: PCPU（流水线 + 中断版） ----------
 PCPU U1(

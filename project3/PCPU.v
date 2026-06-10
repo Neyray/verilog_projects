@@ -133,22 +133,27 @@ module PCPU(
     // ================================================================
     reg [31:0] IF_ID_inst;
     reg [31:0] IF_ID_PC;
+    reg        IF_ID_valid;
 
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             IF_ID_inst <= NOP;
             IF_ID_PC   <= 32'h0;
+            IF_ID_valid <= 1'b0;
         end else if (stall) begin
             // load-use 停顿：保持不变
             IF_ID_inst <= IF_ID_inst;
             IF_ID_PC   <= IF_ID_PC;
+            IF_ID_valid <= IF_ID_valid;
         end else if (flush || mret_taken || int_taken) begin
             // 分支冲刷 / MRET / 中断进入：均要丢弃刚取到的指令
             IF_ID_inst <= NOP;
             IF_ID_PC   <= 32'h0;
+            IF_ID_valid <= 1'b0;
         end else begin
             IF_ID_inst <= inst_in;
             IF_ID_PC   <= PC;
+            IF_ID_valid <= 1'b1;
         end
     end
 
@@ -502,7 +507,7 @@ module PCPU(
 
             // 1) 进入中断（最高优先级）
             if (int_taken) begin
-                mepc        <= PC;        // 当前 PC 是 ISR 完后要回到的位置
+                mepc        <= IF_ID_valid ? IF_ID_PC : PC; // 返回被冲掉的 IF/ID 指令
                 mcause      <= {30'b0, irq_cause_next};
                 mie         <= 1'b0;      // 关中断，禁止嵌套
                 int_pending <= irq_pending_now & ~irq_taken_mask;

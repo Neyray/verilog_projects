@@ -14,11 +14,14 @@
 //   - 中断入口 MTVEC = 32'h0000_0080（ISR 必须放在 0x80）
 //   - 中断进入: 有 pending && mie && !stall && !flush && !mret_taken
 //     → mepc ← PC, mcause ← 类型, mie ← 0, PC ← MTVEC, 冲刷 IF/ID 和 ID/EX
+//   - 同步 trap:
+//       ecall 指令      → mcause=2，mepc←ecall后续指令
+//       非法/未实现指令 → mcause=3，mepc←非法指令后续指令
 //   - CSR 访问通过 store 到 0xD000_xxxx 段（地址被 CPU 内部捕获，不会写到 RAM）:
 //       sw 任意值到 0xD000_0000 → mie ← 1  (使能中断)
 //       sw 任意值到 0xD000_0004 → mie ← 0  (关闭中断)
 //       sw 任意值到 0xD000_0008 → MRET: PC ← mepc, mie ← 1, 冲刷 IF/ID 和 ID/EX
-//       lw 0xD000_000C         → mcause（1=按钮, 2=计时器, 3=辅助按钮）
+//       lw 0xD000_000C         → mcause（1=外部中断, 2=ecall, 3=异常）
 //
 // dm_ctrl[2:0] = funct3[2:0]，与 mem_w 共同描述访存类型：
 //   mem_w=0, dm_ctrl=010 → lw
@@ -62,6 +65,7 @@ module PCPU(
     localparam STORE  = 7'h23;
     localparam ALUI   = 7'h13;
     localparam ALUR   = 7'h33;
+    localparam SYSTEM = 7'h73;
 
     // ================================================================
     // 中断相关常量
@@ -86,7 +90,7 @@ module PCPU(
     // ================================================================
     reg        mie;          // 全局中断使能 (machine interrupt enable)
     reg [31:0] mepc;         // 中断返回地址
-    reg [31:0] mcause;       // 中断类型: 1=按钮, 2=计时器, 3=辅助按钮
+    reg [31:0] mcause;       // trap 类型: 1=外部中断, 2=ecall, 3=异常/非法指令
     reg [2:0]  int_pending;  // 已收到但未处理的中断锁存
     reg [2:0]  int_d;        // INT 边沿采样，避免长按/展宽请求重复入队
 
@@ -110,6 +114,7 @@ module PCPU(
     wire [31:0] branch_target;  // 跳转目标地址
     wire        mret_taken;     // 中断返回（在 EX 阶段检测）
     wire        int_taken;      // 进入中断（IF 边界）
+    wire        trap_taken;     // ecall / exception 同步 trap（EX 阶段）
 
     // PC 更新
     // 优先级: reset > stall > mret > 分支flush > 进入中断 > 顺序 PC+4
@@ -120,6 +125,8 @@ module PCPU(
             PC <= PC;               // load-use 暂停，PC 不动
         else if (mret_taken)
             PC <= mepc;             // 中断返回
+        else if (trap_taken)
+            PC <= MTVEC;            // ecall / exception 进入 ISR
         else if (flush)
             PC <= branch_target;    // 分支/跳转taken
         else if (int_taken)
@@ -145,8 +152,8 @@ module PCPU(
             IF_ID_inst <= IF_ID_inst;
             IF_ID_PC   <= IF_ID_PC;
             IF_ID_valid <= IF_ID_valid;
-        end else if (flush || mret_taken || int_taken) begin
-            // 分支冲刷 / MRET / 中断进入：均要丢弃刚取到的指令
+        end else if (flush || mret_taken || trap_taken || int_taken) begin
+            // 分支冲刷 / MRET / 同步 trap / 中断进入：均要丢弃刚取到的指令
             IF_ID_inst <= NOP;
             IF_ID_PC   <= 32'h0;
             IF_ID_valid <= 1'b0;
@@ -180,6 +187,35 @@ module PCPU(
     wire id_is_store  = (id_opcode == STORE);
     wire id_is_alui   = (id_opcode == ALUI);
     wire id_is_alur   = (id_opcode == ALUR);
+    wire id_is_system = (id_opcode == SYSTEM);
+    wire id_is_ecall  = id_is_system && (IF_ID_inst == 32'h00000073);
+
+    wire id_branch_ok = id_is_branch &&
+        ((id_funct3 == 3'b000) || (id_funct3 == 3'b001) ||
+         (id_funct3 == 3'b100) || (id_funct3 == 3'b101) ||
+         (id_funct3 == 3'b110) || (id_funct3 == 3'b111));
+    wire id_load_ok = id_is_load &&
+        ((id_funct3 == 3'b000) || (id_funct3 == 3'b001) ||
+         (id_funct3 == 3'b010) || (id_funct3 == 3'b100) ||
+         (id_funct3 == 3'b101));
+    wire id_store_ok = id_is_store &&
+        ((id_funct3 == 3'b000) || (id_funct3 == 3'b001) ||
+         (id_funct3 == 3'b010));
+    wire id_alui_shift_ok = ((id_funct3 == 3'b001) && (id_funct7 == 7'b0000000)) ||
+                            ((id_funct3 == 3'b101) &&
+                             ((id_funct7 == 7'b0000000) || (id_funct7 == 7'b0100000)));
+    wire id_alui_ok = id_is_alui &&
+        (((id_funct3 != 3'b001) && (id_funct3 != 3'b101)) || id_alui_shift_ok);
+    wire id_alur_funct7_ok =
+        ((id_funct3 == 3'b000) && ((id_funct7 == 7'b0000000) || (id_funct7 == 7'b0100000))) ||
+        ((id_funct3 == 3'b101) && ((id_funct7 == 7'b0000000) || (id_funct7 == 7'b0100000))) ||
+        ((id_funct3 != 3'b000) && (id_funct3 != 3'b101) && (id_funct7 == 7'b0000000));
+    wire id_alur_ok = id_is_alur && id_alur_funct7_ok;
+    wire id_legal =
+        (IF_ID_inst == NOP) || id_is_lui || id_is_auipc || id_is_jal ||
+        id_is_jalr || id_branch_ok || id_load_ok || id_store_ok ||
+        id_alui_ok || id_alur_ok || id_is_ecall;
+    wire id_illegal = IF_ID_valid && !id_legal;
 
     // --- 立即数生成 ---
     wire [31:0] id_imm_I = {{20{IF_ID_inst[31]}}, IF_ID_inst[31:20]};
@@ -234,6 +270,7 @@ module PCPU(
     reg        ID_EX_is_jal, ID_EX_is_jalr;
     reg        ID_EX_is_lui, ID_EX_is_auipc;
     reg        ID_EX_is_alui, ID_EX_is_alur;
+    reg        ID_EX_is_ecall, ID_EX_illegal;
 
     always @(posedge clk or posedge reset) begin
         if (reset) begin
@@ -259,8 +296,10 @@ module PCPU(
             ID_EX_is_auipc  <= 1'b0;
             ID_EX_is_alui   <= 1'b0;
             ID_EX_is_alur   <= 1'b0;
-        end else if (flush || stall || mret_taken || int_taken) begin
-            // 2. 同步冲刷 / load-use 停顿 / MRET 返回 / 中断进入 → 插入气泡 (NOP)
+            ID_EX_is_ecall  <= 1'b0;
+            ID_EX_illegal   <= 1'b0;
+        end else if (flush || stall || mret_taken || trap_taken || int_taken) begin
+            // 2. 同步冲刷 / load-use 停顿 / MRET 返回 / trap / 中断进入 → 插入气泡 (NOP)
             //    中断进入时必须阻止 IF/ID 里的普通跳转流入 EX，
             //    否则下一拍的 jal/branch flush 会覆盖 MTVEC，导致 ISR 被跳过。
             ID_EX_PC        <= 32'h0;
@@ -284,6 +323,8 @@ module PCPU(
             ID_EX_is_auipc  <= 1'b0;
             ID_EX_is_alui   <= 1'b0;
             ID_EX_is_alur   <= 1'b0;
+            ID_EX_is_ecall  <= 1'b0;
+            ID_EX_illegal   <= 1'b0;
         end else begin
             // 3. 正常流水线传递
             ID_EX_PC        <= IF_ID_PC;
@@ -307,6 +348,8 @@ module PCPU(
             ID_EX_is_auipc  <= id_is_auipc;
             ID_EX_is_alui   <= id_is_alui;
             ID_EX_is_alur   <= id_is_alur;
+            ID_EX_is_ecall  <= id_is_ecall;
+            ID_EX_illegal   <= id_illegal;
         end
     end
 
@@ -472,6 +515,12 @@ module PCPU(
 
     assign mret_taken = ex_is_csr_mret;
 
+    wire ex_ecall_taken = ID_EX_is_ecall && !stall && !flush && !mret_taken;
+    wire ex_exception_taken = ID_EX_illegal && !stall && !flush && !mret_taken;
+    assign trap_taken = ex_ecall_taken || ex_exception_taken;
+    wire [31:0] trap_cause_next =
+        ex_ecall_taken ? 32'd2 : 32'd3;
+
     // ================================================================
     //  中断进入条件
     //
@@ -482,15 +531,13 @@ module PCPU(
     wire [2:0] int_event = INT & ~int_d;
     wire [2:0] irq_pending_now = int_pending | int_event;
     wire [1:0] irq_cause_next =
-        irq_pending_now[0] ? 2'd1 :
-        irq_pending_now[1] ? 2'd2 :
-        irq_pending_now[2] ? 2'd3 : 2'd0;
+        (irq_pending_now != 3'b000) ? 2'd1 : 2'd0;
     wire [2:0] irq_taken_mask =
         irq_pending_now[0] ? 3'b001 :
         irq_pending_now[1] ? 3'b010 :
         irq_pending_now[2] ? 3'b100 : 3'b000;
 
-    assign int_taken = (irq_pending_now != 3'b000) && mie && !stall && !flush && !mret_taken;
+    assign int_taken = (irq_pending_now != 3'b000) && mie && !stall && !flush && !mret_taken && !trap_taken;
 
     // ================================================================
     //  CSR / 中断状态更新
@@ -505,19 +552,26 @@ module PCPU(
         end else begin
             int_d <= INT;
 
-            // 1) 进入中断（最高优先级）
-            if (int_taken) begin
+            // 1) ecall / exception 同步 trap（不受 mie 屏蔽）
+            if (trap_taken) begin
+                mepc        <= ID_EX_PC + 32'd4; // demo 中跳过 ecall/非法指令，避免 MRET 后反复 trap
+                mcause      <= trap_cause_next;
+                mie         <= 1'b0;
+                int_pending <= irq_pending_now;
+            end
+            // 2) 进入外部中断
+            else if (int_taken) begin
                 mepc        <= IF_ID_valid ? IF_ID_PC : PC; // 返回被冲掉的 IF/ID 指令
                 mcause      <= {30'b0, irq_cause_next};
                 mie         <= 1'b0;      // 关中断，禁止嵌套
                 int_pending <= irq_pending_now & ~irq_taken_mask;
             end
-            // 2) MRET
+            // 3) MRET
             else if (mret_taken) begin
                 mie <= 1'b1;
                 int_pending <= irq_pending_now;
             end
-            // 3) 显式使能 / 关闭
+            // 4) 显式使能 / 关闭
             else if (ex_is_csr_enable) begin
                 mie <= 1'b1;
                 int_pending <= irq_pending_now;
@@ -550,6 +604,20 @@ module PCPU(
 
     always @(posedge clk or posedge reset) begin
         if (reset) begin
+            EX_MEM_alu_out  <= 32'h0;
+            EX_MEM_rs2_data <= 32'h0;
+            EX_MEM_PC       <= 32'h0;
+            EX_MEM_rd       <= 5'h0;
+            EX_MEM_funct3   <= 3'h0;
+            EX_MEM_mem_w    <= 1'b0;
+            EX_MEM_wb_en    <= 1'b0;
+            EX_MEM_is_load  <= 1'b0;
+            EX_MEM_is_store <= 1'b0;
+            EX_MEM_is_csr_read <= 1'b0;
+            EX_MEM_csr_rdata   <= 32'h0;
+            EX_MEM_is_jal   <= 1'b0;
+            EX_MEM_is_jalr  <= 1'b0;
+        end else if (trap_taken) begin
             EX_MEM_alu_out  <= 32'h0;
             EX_MEM_rs2_data <= 32'h0;
             EX_MEM_PC       <= 32'h0;

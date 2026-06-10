@@ -1,9 +1,10 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// Module Name: PCPU_TOP  (Project 3 — 流水线 + 中断 + 自定义小程序)
+// Module Name: PCPU_TOP  (Project 3 — 流水线 + trap/中断 + 自定义小程序)
 // Description: 在 Project 2 顶层基础上新增中断源：
 //   1. 指令ROM 加载 custom_int.coe（自定义中断演示程序，主循环 + ISR）
-//   2. 三路中断源：BTN1 游戏确认、timer 周期中断、BTNL/BTNR 辅助中断
+//   2. 外部中断源：BTNC/BTNU/BTNL/BTNR 统一进入 PCPU 外部 INT
+//      ecall 和异常由 PCPU 内部按指令同步产生 trap
 //   3. PCPU.INT 端口由原来的 1'b0 改为 int_sources[2:0]
 //   4. 其余外设、总线、显示通道与 Project 2 完全相同
 //
@@ -256,7 +257,9 @@ always @(posedge Clk_CPU or posedge rst_i) begin
     end
 end
 
-wire [2:0] int_sources = {btn_irq_req[1], timer_irq_pulse, btn_irq_req[0]};
+// 验收口径下三类 trap 为：外部中断(ecall 外部来源)、系统调用 ecall、异常。
+// 因此这里只把按钮接到外部中断；timer_irq_pulse 保留但不接入，避免周期事件干扰验收。
+wire [2:0] int_sources = {btn_irq_req[1], 1'b0, btn_irq_req[0]};
 
 // ---------- U1: PCPU（流水线 + 中断版） ----------
 PCPU U1(
@@ -271,7 +274,7 @@ PCPU U1(
     .Data_out(Data_out),
     .dm_ctrl(dm_ctrl),
     .CPU_MIO(CPU_MIO),
-    .INT(int_sources)           // ★ 三路中断：1=BTN1, 2=timer, 3=BTNL/BTNR
+    .INT(int_sources)           // 外部按钮中断；ecall/异常由 PCPU 内部指令产生
 );
 
 // ---------- U2: ROMD (指令ROM IP核) ----------

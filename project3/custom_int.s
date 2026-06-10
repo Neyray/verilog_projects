@@ -24,12 +24,12 @@ _start:
     addi  x9,  x0, 0            # flash countdown
     addi  x10, x0, 0            # flash kind: 1=EXT, 2=ECALL, 3=EXC
     addi  x13, x0, 1            # moving LED bit
+    addi  x23, x0, 0            # delayed exception demo countdown
 
     sw    x0, 0(x12)            # mie <- 1, enable external interrupt
 
     ecall                       # system call trap, mcause=2
-    .word 0xffffffff            # illegal instruction exception, mcause=3
-    jal   x0, main_loop
+    jal   x0, main_loop         # show ecall first; exception is delayed below
 
     .org 0x80
 isr:
@@ -54,6 +54,7 @@ isr_ecall:
     addi  x6, x6, 1
     addi  x9, x0, 5
     addi  x10, x0, 2
+    addi  x23, x0, 8            # allow EC411 and A002 frames before exception
     sw    x0, 8(x12)            # MRET
 
 isr_exception:
@@ -118,6 +119,15 @@ delay_start:
 delay_loop:
     addi  x20, x20, 1
     bne   x20, x21, delay_loop
+
+    beq   x23, x0, skip_exception_demo
+    addi  x23, x23, -1
+    bne   x23, x0, skip_exception_demo
+    beq   x7, x0, trigger_exception_demo
+    jal   x0, skip_exception_demo
+trigger_exception_demo:
+    .word 0xffffffff            # illegal instruction exception, mcause=3
+skip_exception_demo:
 
     slli  x13, x13, 1
     addi  x22, x0, 16

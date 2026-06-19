@@ -27,7 +27,7 @@
 |------|------|------|
 | Project 1 | **[`project1/README.md`](project1/README.md)** | 单周期 CPU（SCPU），纯组合逻辑串联，理解数据通路的入门 |
 | Project 2 | **[`project2/README.md`](project2/README.md)** | 五级流水线 CPU（PCPU），前递 + 气泡 + 冲刷解决三类冒险 |
-| Project 3 | **[`project3/README.md`](project3/README.md)** | 流水线 CPU + **精确中断 + 自定义序列锁小程序** |
+| Project 3 | **[`project3/README.md`](project3/README.md)** | 流水线 CPU + **三类 trap（外部中断 / ecall / 异常）+ 自定义演示程序** |
 
 > 本根 README 只描述**三个项目共通的内容**（外设框架、地址映射、开关用法、Vivado 流程）。CPU 内部架构、冒险处理、中断机制等请到子 README 看。
 
@@ -40,9 +40,9 @@ Project 1 (SCPU)              Project 2 (PCPU)            Project 3 (PCPU + INT)
 ──────────────────            ────────────────────        ────────────────────────────
 一条指令 = 1 个 Clk_CPU         一条指令 ≈ 1 拍              + CSR + mepc + int_pending
 纯组合逻辑链                    4 组流水寄存器               + memory-mapped CSR 协议
-                              前递 / Stall / Flush         + BTN 上升沿做 INT 脉冲
-                                                          + 自定义反应小游戏
-testac.coe → AC123456         testac.coe → AC123456        custom_int.coe → 按 BTNU 玩游戏
+                              前递 / Stall / Flush         + 外部中断/ecall/异常三类 trap
+                                                          + ISR 读 mcause 分发
+testac.coe → AC123456         testac.coe → AC123456        custom_int.coe → 自动 ecall/异常 + 按键中断
 ```
 
 每一步都保留前一步的全部功能；外设、总线、时钟分频、`testac.coe` 都不变。CPU 之外的改动只发生在顶层（如 Project 3 新增 INT 链路）。
@@ -128,13 +128,13 @@ SPIO ─────────────────────────
 | `SW2` | `clk_div.SW2` | `0`=快档 `clkdiv[3]`（≈6 MHz）；`1`=慢档 `clkdiv[24]`（≈3 Hz，肉眼看 PC 跑动） |
 | `SW7,SW6,SW5` | `Multi_8CH32.Switch[2:0]` | 选择 8 路 32bit 信号中送数码管显示的那一路 |
 | `rstn` | 顶层 | 低有效复位（按下复位） |
-| `BTNU = btn_i[1]` | P1/P2：未用；**P3：游戏确认键 + 中断源** | — |
+| `BTNC/BTNU/BTNL/BTNR` | P1/P2：未用；**P3：外部中断源（任意键触发 `mcause=1`）** | — |
 
 `Multi_8CH32` 的 8 个数据通道：
 
 | SW7 SW6 SW5 | 通道 | 显示内容 | 备注 |
 |-------------|------|----------|------|
-| 0 0 0 | `data0 = Peripheral_in` | 最近一次写入 `0xE000_0000` 的数据 | P1/P2 看进度码，P3 看状态码 |
+| 0 0 0 | `data0 = Peripheral_in` | 最近一次写入 `0xE000_0000` 的数据 | P1/P2 看进度码，P3 看 trap 状态码 |
 | 0 0 1 | `data1 = {2'b00, PC[31:2]}` | PC 的字地址 | 跟踪指令编号 |
 | 0 1 0 | `data2 = spo` | 当前 ROMD 输出的指令机器码 | 当前正在执行的 32bit 指令 |
 | 0 1 1 | `data3` | P1：浮空；P2/P3：`counter_out` | 计数器值 |
@@ -143,7 +143,7 @@ SPIO ─────────────────────────
 | 1 1 0 | `data6 = Cpu_data4bus` | 总线读回的 32bit 字 | `lw` 读到了什么 |
 | 1 1 1 | `data7 = PC_out` | PC 原值（字节地址） | 真实 PC，对照反汇编 |
 
-LED 显示的是程序写到 `0xF000_0000` 的低 16 位。P1/P2 同步进度码；P3 高 8 位 = 当前目标位、低 8 位 = 移动光标。
+LED 显示的是程序写到 `0xF000_0000` 的低 16 位。P1/P2 同步进度码；P3 低 4 位 = 移动光标，高 12 位 = 外部中断/ecall/异常三类计数（详见 [`project3/README.md`](project3/README.md#显示编码)）。
 
 ---
 

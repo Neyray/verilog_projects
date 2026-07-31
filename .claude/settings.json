@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(iverilog:*)",
+      "Bash(vvp:*)",
+      "Bash(gtkwave:*)",
+      "Bash(make:*)",
+      "Bash(make -C test:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)"
+    ]
+  }
+}

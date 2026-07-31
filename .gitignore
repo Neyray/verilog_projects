@@ -1,1 +1,13 @@
+# Claude Code local overrides (personal, not shared with the team)
 .claude/settings.local.json
+.claude/worktrees/
+
+# Vivado project litter (only relevant if a Vivado project is created locally)
+*.jou
+*.log
+.Xil/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/

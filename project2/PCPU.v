@@ -7,7 +7,11 @@
 // 冒险处理:
 //   1. 数据冒险: EX/MEM 和 MEM/WB 前递 (Forwarding)
 //   2. Load-Use 冒险: 插入1拍气泡 (Stall)
-//   3. 控制冒险: 分支/跳转在 EX 阶段判断，冲刷 IF/ID 和 ID/EX (Flush 2条)
+//   3. 控制冒险:
+//      - JAL：无条件跳转、目标不依赖任何寄存器（PC+imm），提前在 ID 阶段判定，
+//        只需冲刷 IF/ID (Flush 1条)。
+//      - JALR / 条件分支（taken）：目标依赖寄存器值，仍在 EX 阶段判断，
+//        冲刷 IF/ID 和 ID/EX (Flush 2条)。
 //
 // dm_ctrl[2:0] = funct3[2:0]，与 mem_w 共同描述访存类型：
 //   mem_w=0, dm_ctrl=010 → lw
@@ -74,7 +78,9 @@ module PCPU(
 
     // --- 前向声明冒险控制信号（后面会赋值） ---
     wire        stall;          // load-use 停顿
-    wire        flush;          // 分支/跳转冲刷
+    wire        flush;          // PC 重定向 + IF/ID 冲刷（EX 分支/JALR taken，或 ID 阶段提前判定的 JAL）
+    wire        flush_idex;     // ID/EX 冲刷——仅 EX 阶段判出的分支/JALR taken 才需要，
+                                 // JAL 提前在 ID 判定时 JAL 本身要正常流入 ID/EX（用于写回 PC+4），不冲刷
     wire [31:0] branch_target;  // 跳转目标地址
 
     // PC 更新
@@ -215,8 +221,11 @@ module PCPU(
             ID_EX_is_auipc  <= 1'b0;
             ID_EX_is_alui   <= 1'b0;
             ID_EX_is_alur   <= 1'b0;
-        end else if (flush || stall) begin
+        end else if (flush_idex || stall) begin
             // 2. 同步冲刷 / load-use停顿 → 插入气泡 (NOP)
+            // 注意：这里用 flush_idex（只对应 EX 阶段判出的分支/JALR taken），
+            // 不用 flush ——因为 flush 还包含 ID 阶段提前判定的 JAL，
+            // 而 JAL 本身需要正常流入 ID/EX（继续走 EX/MEM/WB 写回 PC+4），不能被冲掉。
             ID_EX_PC        <= 32'h0;
             ID_EX_rs1_data  <= 32'h0;
             ID_EX_rs2_data  <= 32'h0;
@@ -360,18 +369,37 @@ module PCPU(
         endcase
     end
 
-    // --- 跳转/分支目标地址计算 ---
+    // --- 跳转/分支目标地址计算（EX 阶段负责 JALR / 条件分支）---
+    // 注意：这里不再包含 JAL。JAL 不依赖任何寄存器（目标 = PC + imm），
+    // 已经提前在 ID 阶段判定并跳转（见下方 id_jal_target / id_jal_flush）。
+    // 如果这里仍然包含 ID_EX_is_jal，JAL 到达 EX 时会重复触发一次冲刷，
+    // 把 ID 阶段刚从正确目标取回来的指令又冲掉一次——那样反而变成 3 拍代价，
+    // 所以必须去掉，让 JAL 只在 ID 触发一次。
     wire [31:0] ex_branch_target =
-        ID_EX_is_jal                         ? (ID_EX_PC + ID_EX_imm) :
         ID_EX_is_jalr                        ? ((ex_rs1_data + ID_EX_imm) & ~32'h1) :
         (ID_EX_is_branch & branch_taken)     ? (ID_EX_PC + ID_EX_imm) :
                                                32'h0;  // 不使用
 
-    // --- 是否需要跳转（flush 信号） ---
-    wire ex_pc_sel = ID_EX_is_jal | ID_EX_is_jalr | (ID_EX_is_branch & branch_taken);
+    // --- EX 阶段是否需要跳转（JALR，或条件分支 taken） ---
+    wire flush_ex = ID_EX_is_jalr | (ID_EX_is_branch & branch_taken);
 
-    assign flush          = ex_pc_sel;
-    assign branch_target  = ex_branch_target;
+    // --- ID 阶段提前判定 JAL ---
+    // JAL 是无条件跳转，目标 = IF_ID_PC + imm_J，不读任何寄存器、不需要前递，
+    // 所以可以在 ID 阶段（指令刚被取出、还没进 ID/EX）就直接算出目标并跳转，
+    // 把原来"IF/ID + ID/EX 两级冲刷"降为"只冲刷 IF/ID 一级"。
+    wire [31:0] id_jal_target = IF_ID_PC + id_imm;   // id_imm 在 id_is_jal 时已经选中 id_imm_J
+    wire        id_jal_flush  = id_is_jal;
+
+    // flush：驱动 PC 重定向 + IF/ID 冲刷。
+    //   - flush_ex=1（EX 判出的分支/JALR taken）优先：此时 ID 阶段里的内容
+    //     一定是被那条 EX 指令牵连的错误路径取指（哪怕它碰巧长得像一条 JAL，
+    //     也是垂危、必须整条作废的取指结果），目标必须用 ex_branch_target，
+    //     同时 ID/EX 也要被冲掉（见 flush_idex），JAL 自己的 id_jal_flush 在
+    //     这种情况下不能生效、不能抢占目标地址。
+    //   - flush_ex=0 时才看 id_jal_flush：真正合法路径上的 JAL，只冲刷 IF/ID。
+    assign flush          = flush_ex | id_jal_flush;
+    assign flush_idex      = flush_ex;
+    assign branch_target  = flush_ex ? ex_branch_target : id_jal_target;
 
     // ================================================================
     //  Load-Use 冒险检测

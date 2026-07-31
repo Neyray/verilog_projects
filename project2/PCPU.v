@@ -296,11 +296,11 @@ module PCPU(
         ID_EX_is_lui   ? 32'b0      :
                          ex_rs1_data;
 
+    // 注：id_imm 已在 ID 阶段按指令类型选好对应立即数（U/S/I），
+    // 这里非 ALUR/BRANCH 的情况都直接用 ID_EX_imm，不需要再区分 LUI/AUIPC/STORE。
     wire [31:0] alu_B =
         (ID_EX_is_alur | ID_EX_is_branch) ? ex_rs2_data :
-        (ID_EX_is_lui  | ID_EX_is_auipc)  ? ID_EX_imm   :
-        ID_EX_is_store                     ? ID_EX_imm   :
-                                             ID_EX_imm;   // LOAD, ALUI, JALR
+                                             ID_EX_imm;   // LUI, AUIPC, LOAD, STORE, ALUI, JALR
 
     wire [4:0] shamt = ID_EX_is_alur ? ex_rs2_data[4:0] : ID_EX_imm[4:0];
 
@@ -372,20 +372,6 @@ module PCPU(
 
     assign flush          = ex_pc_sel;
     assign branch_target  = ex_branch_target;
-
-    // --- EX 阶段产生的"写回数据候选"（用于前递，不含 load） ---
-    // 注意：load 的数据要到 MEM 阶段才拿到，所以 load-use 需要 stall
-
-    //这是一个中间信号，它表示：仅仅在 EX 这个阶段，我们能算出的“准备写回”的数据是什么？
-    //如果是算术指令，结果自然是 ALU 算出来的 alu_out
-    //如果是跳转指令（JAL/JALR），我们要把返回地址（也就是当前指令的下一条，PC+4）存进寄存器里，所以结果是 ID_EX_PC + 32'd4
-
-    //实际上是废代码，使用的是451行的ex_mem_wb_data
-    wire [31:0] ex_wb_candidate =
-        (ID_EX_is_jal | ID_EX_is_jalr) ? (ID_EX_PC + 32'd4) :
-                                          alu_out;
-
-
 
     // ================================================================
     //  Load-Use 冒险检测

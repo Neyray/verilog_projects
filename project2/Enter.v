@@ -10,11 +10,6 @@ module   Enter(input clk,
             );
 	// TODO 防抖
 
-    // always @(*) begin
-    //     BTN_out = BTN;
-    //     SW_out = SW;
-    // end
-	
     assign BTN_out = BTN;
     assign SW_out = SW;
 

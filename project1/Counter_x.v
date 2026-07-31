@@ -26,7 +26,7 @@ reg sq0,sq1,sq2,M0,M1,M2,clr0,clr1,clr2;
 		
 	always @ (posedge clk or posedge rst) begin 
 		if (rst )
-			begin counter0_Lock <=0;counter1_Lock <=0;counter2_Lock <=0;counter_Ctrl<=0; end
+			begin counter0_Lock <=0;counter1_Lock <=0;counter2_Lock <=0;counter_Ctrl<=0; M0<=0;clr0<=0; end
 		else	 	
 			if (counter_we) begin
 				case(counter_ch)
